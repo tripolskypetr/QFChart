@@ -15,7 +15,7 @@ export default function App() {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const [code, setCode] = useState(DEFAULT_CODE);
   const [symbol, setSymbol] = useState('BTCUSDT');
-  const [timeframe, setTimeframe] = useState('D');
+  const [timeframe, setTimeframe] = useState('1');
   const [fromDate, setFromDate] = useState('');
   const [toDate, setToDate] = useState('');
 
