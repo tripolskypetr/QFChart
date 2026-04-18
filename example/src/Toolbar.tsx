@@ -1,4 +1,3 @@
-const SYMBOLS = ['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'BNBUSDC'] as const;
 const TIMEFRAMES = ['1', '5', '15', '60', 'D', 'W'] as const;
 
 interface ToolbarProps {
@@ -35,9 +34,7 @@ export function Toolbar({
 }: ToolbarProps) {
   return (
     <div style={{ display: 'flex', gap: 8, padding: '8px 12px', background: '#1e293b', alignItems: 'center', flexShrink: 0 }}>
-      <select value={symbol} onChange={(e) => onSymbolChange(e.target.value)} style={selectStyle}>
-        {SYMBOLS.map((s) => <option key={s}>{s}</option>)}
-      </select>
+      <input type="text" value={symbol} onChange={(e) => onSymbolChange(e.target.value.toUpperCase())} style={{ ...selectStyle, width: 100 }} placeholder="BTCUSDT" />
       <select value={timeframe} onChange={(e) => onTimeframeChange(e.target.value)} style={selectStyle}>
         {TIMEFRAMES.map((t) => <option key={t}>{t}</option>)}
       </select>

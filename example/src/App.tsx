@@ -14,7 +14,7 @@ plot(sma, "SMA", color.blue, linewidth=2)`;
 export default function App() {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const [code, setCode] = useState(DEFAULT_CODE);
-  const [symbol, setSymbol] = useState('BTCUSDC');
+  const [symbol, setSymbol] = useState('BTCUSDT');
   const [timeframe, setTimeframe] = useState('D');
   const [fromDate, setFromDate] = useState('');
   const [toDate, setToDate] = useState('');
