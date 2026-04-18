@@ -1,0 +1,398 @@
+import { OHLCV, Indicator as IndicatorType, QFChartOptions, IndicatorPlot, IndicatorStyle } from '../types';
+import { PaneConfiguration } from './LayoutManager';
+import { SeriesRendererFactory } from './SeriesRendererFactory';
+import { AxisUtils } from '../utils/AxisUtils';
+import { FillRenderer, BatchedFillEntry } from './renderers/FillRenderer';
+import { ColorUtils } from '../utils/ColorUtils';
+
+export class SeriesBuilder {
+    private static readonly DEFAULT_COLOR = '#2962ff';
+
+    public static buildCandlestickSeries(marketData: OHLCV[], options: QFChartOptions, totalLength?: number): any {
+        const upColor = options.upColor || '#00da3c';
+        const downColor = options.downColor || '#ec0000';
+
+        const data = marketData.map((d) => [d.open, d.close, d.low, d.high]);
+
+        // Pad with nulls if totalLength is provided and greater than current data length
+        if (totalLength && totalLength > data.length) {
+            const padding = totalLength - data.length;
+            for (let i = 0; i < padding; i++) {
+                data.push(null as any);
+            }
+        }
+
+        // Build markLine for last price if enabled
+        let markLine = undefined;
+        if (options.lastPriceLine?.visible !== false && marketData.length > 0) {
+            const lastBar = marketData[marketData.length - 1];
+            const lastClose = lastBar.close;
+            const isUp = lastBar.close >= lastBar.open;
+            // Use configured color, or dynamic color based on candle direction
+            const lineColor = options.lastPriceLine?.color || (isUp ? upColor : downColor);
+            let lineStyleType = options.lastPriceLine?.lineStyle || 'dashed';
+
+            if (lineStyleType.startsWith('linestyle_')) {
+                lineStyleType = lineStyleType.replace('linestyle_', '') as any;
+            }
+            const decimals = options.yAxisDecimalPlaces !== undefined ? options.yAxisDecimalPlaces : AxisUtils.autoDetectDecimals(marketData);
+
+            markLine = {
+                symbol: ['none', 'none'],
+                precision: decimals, // Ensure line position is precise enough for small values
+                data: [
+                    {
+                        yAxis: lastClose,
+                        label: {
+                            show: true,
+                            position: 'end', // Right side
+                            formatter: (params: any) => {
+                                // Respect Y-axis formatting options
+                                if (options.yAxisLabelFormatter) {
+                                    return options.yAxisLabelFormatter(params.value);
+                                }
+                                return AxisUtils.formatValue(params.value, decimals);
+                            },
+                            color: '#fff',
+                            backgroundColor: lineColor,
+                            padding: [2, 4],
+                            borderRadius: 2,
+                            fontSize: 11,
+                            fontWeight: 'bold',
+                        },
+                        lineStyle: {
+                            color: lineColor,
+                            type: lineStyleType,
+                            width: 1,
+                            opacity: 0.8,
+                        },
+                    },
+                ],
+                animation: false,
+                silent: true, // Disable interaction
+            };
+        }
+
+        return {
+            type: 'candlestick',
+            id: '__candlestick__',
+            name: options.title,
+            data: data,
+            itemStyle: {
+                color: upColor,
+                color0: downColor,
+                borderColor: upColor,
+                borderColor0: downColor,
+            },
+            markLine: markLine,
+            xAxisIndex: 0,
+            yAxisIndex: 0,
+            z: 5,
+        };
+    }
+
+    public static buildIndicatorSeries(
+        indicators: Map<string, IndicatorType>,
+        timeToIndex: Map<number, number>,
+        paneLayout: PaneConfiguration[],
+        totalDataLength: number,
+        dataIndexOffset: number = 0,
+        candlestickData?: OHLCV[], // Add candlestick data to access High/Low for positioning
+        overlayYAxisMap?: Map<string, number>, // Map of overlay indicator IDs to their Y-axis indices
+        separatePaneYAxisOffset: number = 1, // Offset for separate pane Y-axes (accounts for overlay axes)
+    ): { series: any[]; barColors: (string | null)[] } {
+        const series: any[] = [];
+        const barColors: (string | null)[] = new Array(totalDataLength).fill(null);
+
+        // Extract raw (non-null) market data for resolving xloc.bar_time coordinates
+        const rawMarketData = candlestickData?.filter((d): d is OHLCV => d != null && d.time !== undefined);
+
+        // Store plot data arrays for fill plots to reference
+        const plotDataArrays = new Map<string, number[]>();
+
+        indicators.forEach((indicator, id) => {
+            if (indicator.collapsed) return; // Skip if collapsed
+
+            // Sort plots so that 'fill' plots are processed last
+            // This ensures that the plots they reference (plot1, plot2) have already been processed and their data stored
+            const sortedPlots = Object.keys(indicator.plots).sort((a, b) => {
+                const plotA = indicator.plots[a];
+                const plotB = indicator.plots[b];
+                const isFillA = plotA.options.style === 'fill';
+                const isFillB = plotB.options.style === 'fill';
+                if (isFillA && !isFillB) return 1;
+                if (!isFillA && isFillB) return -1;
+                return 0;
+            });
+
+            // Collect non-gradient fill plots for batching (performance: N series → 1 series)
+            // Keyed by "xAxisIndex:yAxisIndex" to batch fills on the same axis pair
+            const pendingFills = new Map<string, { entries: BatchedFillEntry[]; xAxisIndex: number; yAxisIndex: number }>();
+
+            sortedPlots.forEach((plotName) => {
+                const plot = indicator.plots[plotName];
+
+                // display.none: don't render visually, but still populate data arrays
+                // so that fill() plots referencing this plot can find the data.
+                const isDisplayNone = plot.options.display === 'none';
+
+                const seriesName = `${id}::${plotName}`;
+
+                // Find axis index for THIS SPECIFIC PLOT
+                let xAxisIndex = 0;
+                let yAxisIndex = 0;
+
+                // Check plot-level overlay setting (overrides indicator-level setting)
+                // IMPORTANT: If indicator is overlay (paneIndex === 0), treat all plots as overlays
+                // This allows visual-only plots (background, barcolor) to have separate Y-axes while
+                // still being on the main chart pane
+                let plotOverlay = plot.options.overlay;
+
+                // Fill plots inherit overlay from their referenced plots.
+                // If either referenced plot is overlay, the fill should render on the
+                // overlay pane too — otherwise its price-scale data stretches the
+                // indicator sub-pane's y-axis to extreme ranges.
+                if (plot.options.style === 'fill' && plotOverlay === undefined) {
+                    const p1Name = plot.options.plot1;
+                    const p2Name = plot.options.plot2;
+                    if (p1Name && p2Name) {
+                        const p1 = indicator.plots[p1Name];
+                        const p2 = indicator.plots[p2Name];
+                        if (p1?.options?.overlay === true || p2?.options?.overlay === true) {
+                            plotOverlay = true;
+                        }
+                    }
+                }
+
+                const isPlotOverlay = indicator.paneIndex === 0 || plotOverlay === true;
+
+                if (isPlotOverlay) {
+                    // Plot should be on main chart (overlay)
+                    xAxisIndex = 0;
+                    if (overlayYAxisMap && overlayYAxisMap.has(seriesName)) {
+                        // This specific plot has its own Y-axis (incompatible with price range)
+                        yAxisIndex = overlayYAxisMap.get(seriesName)!;
+                    } else {
+                        // Shares main Y-axis with candlesticks
+                        yAxisIndex = 0;
+                    }
+                } else {
+                    // Plot should be in indicator's separate pane
+                    const confIndex = paneLayout.findIndex((p) => p.index === indicator.paneIndex);
+                    if (confIndex !== -1) {
+                        xAxisIndex = confIndex + 1;
+                        yAxisIndex = separatePaneYAxisOffset + confIndex;
+                    }
+                }
+
+                // Prepare data arrays
+                // For 'fill' style, we don't use plot.data directly in the same way, but we initialize generic arrays
+                const dataArray = new Array(totalDataLength).fill(null);
+                const rawDataArray = new Array(totalDataLength).fill(null); // Unmodified values for fill references
+                const colorArray = new Array(totalDataLength).fill(null);
+                const optionsArray = new Array(totalDataLength).fill(null); // Store per-point options
+
+                plot.data?.forEach((point) => {
+                    const index = timeToIndex.get(point.time);
+                    if (index !== undefined) {
+                        const plotOffset = point.options?.offset ?? plot.options.offset ?? 0;
+                        const offsetIndex = index + dataIndexOffset + plotOffset;
+
+                        if (offsetIndex >= 0 && offsetIndex < totalDataLength) {
+                            let value = point.value;
+                            const pointColor = point.options?.color;
+
+                            // Always store the raw value for fill plots to reference
+                            // (fills need the actual data even when the line is invisible via color=na)
+                            rawDataArray[offsetIndex] = value;
+
+                            // TradingView compatibility: if color is 'na' (NaN, null, undefined, or "na"), break the line
+                            // When the options object explicitly has a 'color' key set to undefined,
+                            // this means PineTS evaluated the color expression to na (hidden segment).
+                            const hasExplicitColorKey = point.options != null && 'color' in point.options;
+                            const isNaColor =
+                                pointColor === null ||
+                                pointColor === 'na' ||
+                                pointColor === 'NaN' ||
+                                (typeof pointColor === 'number' && isNaN(pointColor)) ||
+                                (hasExplicitColorKey && pointColor === undefined);
+
+                            if (isNaColor) {
+                                value = null;
+                            }
+
+                            dataArray[offsetIndex] = value;
+                            colorArray[offsetIndex] = isNaColor ? null : pointColor || plot.options.color || SeriesBuilder.DEFAULT_COLOR;
+                            optionsArray[offsetIndex] = point.options || {};
+                        }
+                    }
+                });
+
+                // Store raw data array (before na-color nullification) for fill plots to reference
+                // Fill plots need the actual numeric values even when the referenced plot is invisible (color=na)
+                plotDataArrays.set(`${id}::${plotName}`, rawDataArray);
+
+                // display.none plots: data is now stored for fill references, skip rendering
+                if (isDisplayNone) return;
+
+                if (plot.options?.style?.startsWith('style_')) {
+                    plot.options.style = plot.options.style.replace('style_', '') as IndicatorStyle;
+                }
+
+                // Handle barcolor specifically as it modifies shared state (barColors)
+                if (plot.options.style === 'barcolor') {
+                    // Apply colors to main chart candlesticks
+                    plot.data?.forEach((point) => {
+                        const index = timeToIndex.get(point.time);
+                        if (index !== undefined) {
+                            const plotOffset = point.options?.offset ?? plot.options.offset ?? 0;
+                            const offsetIndex = index + dataIndexOffset + plotOffset;
+
+                            if (offsetIndex >= 0 && offsetIndex < totalDataLength) {
+                                const pointColor = point.options?.color || plot.options.color || SeriesBuilder.DEFAULT_COLOR;
+                                const isNaColor =
+                                    pointColor === null ||
+                                    pointColor === 'na' ||
+                                    pointColor === 'NaN' ||
+                                    (typeof pointColor === 'number' && isNaN(pointColor));
+
+                                if (!isNaColor && point.value !== null && point.value !== undefined) {
+                                    barColors[offsetIndex] = pointColor;
+                                }
+                            }
+                        }
+                    });
+                    return; // Skip rendering a series for barcolor
+                }
+
+                // Tables are rendered as DOM overlays, not ECharts series
+                if (plot.options.style === 'table') {
+                    return;
+                }
+
+                // Batch non-gradient fill plots for performance
+                // Instead of creating N separate ECharts custom series (one per fill),
+                // collect them and render as a single batched series per axis pair.
+                if (plot.options.style === 'fill' && plot.options.gradient !== true) {
+                    const plot1Key = plot.options.plot1 ? `${id}::${plot.options.plot1}` : null;
+                    const plot2Key = plot.options.plot2 ? `${id}::${plot.options.plot2}` : null;
+
+                    if (plot1Key && plot2Key) {
+                        const plot1Data = plotDataArrays.get(plot1Key);
+                        const plot2Data = plotDataArrays.get(plot2Key);
+
+                        if (plot1Data && plot2Data) {
+                            // Parse per-bar colors
+                            const { color: defaultColor, opacity: defaultOpacity } = ColorUtils.parseColor(
+                                plot.options.color || 'rgba(128, 128, 128, 0.2)',
+                            );
+                            const hasPerBarColor = optionsArray.some((o: any) => o && o.color !== undefined);
+
+                            const fillBarColors: { color: string; opacity: number }[] = [];
+                            for (let i = 0; i < totalDataLength; i++) {
+                                const opts = optionsArray[i];
+                                if (hasPerBarColor && opts && opts.color !== undefined) {
+                                    fillBarColors[i] = ColorUtils.parseColor(opts.color);
+                                } else {
+                                    fillBarColors[i] = { color: defaultColor, opacity: defaultOpacity };
+                                }
+                            }
+
+                            const axisKey = `${xAxisIndex}:${yAxisIndex}`;
+                            if (!pendingFills.has(axisKey)) {
+                                pendingFills.set(axisKey, { entries: [], xAxisIndex, yAxisIndex });
+                            }
+                            pendingFills.get(axisKey)!.entries.push({
+                                plot1Data,
+                                plot2Data,
+                                barColors: fillBarColors,
+                            });
+                            return; // Defer series creation to batch step below
+                        }
+                    }
+                }
+
+                // Skip fully transparent / invisible plots — they exist only as data sources for fills.
+                // Their data is already stored in plotDataArrays for fill references.
+                // Covers: color(na) → null, color.new(x, 100) → fully transparent string, etc.
+                {
+                    const plotColor = plot.options.color;
+                    let skipPlot = false;
+                    if (plotColor == null) {
+                        // color(na) — plot-level color is null/undefined; skip if no bar has a visible color
+                        const hasVisibleBarColor = colorArray.some((c: any) => c != null);
+                        skipPlot = !hasVisibleBarColor;
+                    } else if (typeof plotColor === 'string') {
+                        const parsed = ColorUtils.parseColor(plotColor);
+                        if (parsed.opacity < 0.01) {
+                            const hasVisibleBarColor = colorArray.some((c: any) => {
+                                if (c == null) return false;
+                                const pc = ColorUtils.parseColor(c);
+                                return pc.opacity >= 0.01;
+                            });
+                            skipPlot = !hasVisibleBarColor;
+                        }
+                    }
+                    if (skipPlot) return;
+                }
+
+                // Use Factory to get appropriate renderer
+                const renderer = SeriesRendererFactory.get(plot.options.style);
+                const seriesConfig = renderer.render({
+                    seriesName,
+                    xAxisIndex,
+                    yAxisIndex,
+                    dataArray,
+                    colorArray,
+                    optionsArray,
+                    plotOptions: plot.options,
+                    candlestickData,
+                    plotDataArrays,
+                    indicatorId: id,
+                    plotName: plotName,
+                    dataIndexOffset,
+                    timeToIndex,
+                    marketData: rawMarketData,
+                });
+
+                if (seriesConfig) {
+                    series.push(seriesConfig);
+                }
+            });
+
+            // Batch pending fills: merge multiple fill series into single batched series per axis pair
+            if (pendingFills.size > 0) {
+                const fillRenderer = new FillRenderer();
+                pendingFills.forEach(({ entries, xAxisIndex, yAxisIndex }, axisKey) => {
+                    if (entries.length >= 2) {
+                        // Batch multiple fills into a single ECharts custom series
+                        const batchedConfig = fillRenderer.renderBatched(
+                            `${id}::fills_batch_${axisKey}`,
+                            xAxisIndex,
+                            yAxisIndex,
+                            totalDataLength,
+                            entries,
+                        );
+                        if (batchedConfig) {
+                            series.push(batchedConfig);
+                        }
+                    } else if (entries.length === 1) {
+                        // Single fill — still use batched renderer for consistency (clip + encode)
+                        const batchedConfig = fillRenderer.renderBatched(
+                            `${id}::fills_batch_${axisKey}`,
+                            xAxisIndex,
+                            yAxisIndex,
+                            totalDataLength,
+                            entries,
+                        );
+                        if (batchedConfig) {
+                            series.push(batchedConfig);
+                        }
+                    }
+                });
+            }
+        });
+
+        return { series, barColors };
+    }
+}

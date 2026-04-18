@@ -1,0 +1,1932 @@
+import * as echarts from 'echarts';
+import { OHLCV, IndicatorPlot, QFChartOptions, Indicator as IndicatorInterface, ChartContext, Plugin, DrawingRenderer } from './types';
+import { Indicator } from './components/Indicator';
+import { LayoutManager, LayoutResult, PaneBoundary } from './components/LayoutManager';
+import { SeriesBuilder } from './components/SeriesBuilder';
+import { GraphicBuilder } from './components/GraphicBuilder';
+import { TooltipFormatter } from './components/TooltipFormatter';
+import { PluginManager } from './components/PluginManager';
+import { DrawingEditor } from './components/DrawingEditor';
+import { DrawingRendererRegistry } from './components/DrawingRendererRegistry';
+import { EventBus } from './utils/EventBus';
+import { AxisUtils } from './utils/AxisUtils';
+import { TableOverlayRenderer } from './components/TableOverlayRenderer';
+import { TableCanvasRenderer } from './components/TableCanvasRenderer';
+
+export class QFChart implements ChartContext {
+    private chart: echarts.ECharts;
+    private options: QFChartOptions;
+    private marketData: OHLCV[] = [];
+    private indicators: Map<string, Indicator> = new Map();
+    private timeToIndex: Map<number, number> = new Map();
+    private pluginManager: PluginManager;
+    private drawingEditor: DrawingEditor;
+    public events: EventBus = new EventBus();
+    private isMainCollapsed: boolean = false;
+    private maximizedPaneId: string | null = null;
+    private countdownInterval: any = null;
+
+    private selectedDrawingId: string | null = null; // Track selected drawing
+
+    // Drawing System
+    private drawings: import('./types').DrawingElement[] = [];
+    private drawingRenderers: DrawingRendererRegistry = new DrawingRendererRegistry();
+
+    public coordinateConversion = {
+        pixelToData: (point: { x: number; y: number }) => {
+            // Find which grid/pane the point is in
+            // We iterate through all panes (series indices usually match pane indices for base series)
+            // Actually, we need to know how many panes there are.
+            // We can use the layout logic or just check grid indices.
+            // ECharts instance has getOption().
+            const option = this.chart.getOption() as any;
+            if (!option || !option.grid) return null;
+
+            const gridCount = option.grid.length;
+            for (let i = 0; i < gridCount; i++) {
+                if (this.chart.containPixel({ gridIndex: i }, [point.x, point.y])) {
+                    // Found the pane
+                    const p = this.chart.convertFromPixel({ seriesIndex: i }, [point.x, point.y]);
+                    // Note: convertFromPixel might need seriesIndex or gridIndex depending on setup.
+                    // Using gridIndex in convertFromPixel is supported in newer ECharts but sometimes tricky.
+                    // Since we have one base series per pane (candlestick at 0, indicators at 1+),
+                    // assuming seriesIndex = gridIndex usually works if they are mapped 1:1.
+                    // Wait, candlestick is series 0. Indicators are subsequent series.
+                    // Series index != grid index necessarily.
+                    // BUT we can use { gridIndex: i } for convertFromPixel too!
+                    const pGrid = this.chart.convertFromPixel({ gridIndex: i }, [point.x, point.y]);
+
+                    if (pGrid) {
+                        // Store in real data indices (subtract padding offset).
+                        // This makes drawing coordinates independent of lazy padding
+                        // expansion — when _resizePadding() changes dataIndexOffset,
+                        // stored coordinates stay valid without manual updating.
+                        return { timeIndex: Math.round(pGrid[0]) - this.dataIndexOffset, value: pGrid[1], paneIndex: i };
+                    }
+                }
+            }
+            return null;
+        },
+        dataToPixel: (point: { timeIndex: number; value: number; paneIndex?: number }) => {
+            const paneIdx = point.paneIndex || 0;
+            // Convert real data index back to padded space for ECharts
+            const p = this.chart.convertToPixel({ gridIndex: paneIdx }, [point.timeIndex + this.dataIndexOffset, point.value]);
+            if (p) {
+                return { x: p[0], y: p[1] };
+            }
+            return null;
+        },
+    };
+
+    // Default colors and constants
+    private readonly upColor: string = '#00da3c';
+    private readonly downColor: string = '#ec0000';
+    private readonly defaultPadding = 0.0;
+    private padding: number;
+    private dataIndexOffset: number = 0; // Offset for phantom padding data
+    private _paddingPoints: number = 0; // Current symmetric padding (empty bars per side)
+    private readonly LAZY_MIN_PADDING = 5; // Always have a tiny buffer so edge scroll triggers
+    private readonly LAZY_MAX_PADDING = 500; // Hard cap per side
+    private readonly LAZY_CHUNK_SIZE = 50; // Bars added per expansion
+    private readonly LAZY_EDGE_THRESHOLD = 10; // Bars from edge to trigger
+    private _expandScheduled: boolean = false; // Debounce flag
+
+    // DOM Elements for Layout
+    private rootContainer: HTMLElement;
+    private layoutContainer: HTMLElement;
+    private toolbarContainer: HTMLElement; // New Toolbar
+    private leftSidebar: HTMLElement;
+    private rightSidebar: HTMLElement;
+    private chartContainer: HTMLElement;
+    private overlayContainer: HTMLElement;
+    private _lastTables: any[] = [];
+    private _tableGraphicIds: string[] = []; // Track canvas table graphic IDs for cleanup
+    private _baseGraphics: any[] = []; // Non-table graphic elements (title, watermark, pane labels)
+    private _labelTooltipEl: HTMLElement | null = null; // Floating tooltip for label.set_tooltip()
+
+    // Pane drag-resize state
+    private _lastLayout: (LayoutResult & { overlayYAxisMap: Map<string, number>; separatePaneYAxisOffset: number }) | null = null;
+    private _mainHeightOverride: number | null = null;
+    private _paneDragState: {
+        startY: number;
+        aboveId: string | 'main';
+        belowId: string;
+        startAboveHeight: number;
+        startBelowHeight: number;
+    } | null = null;
+    private _paneResizeRafId: number | null = null;
+
+    constructor(container: HTMLElement, options: QFChartOptions = {}) {
+        this.rootContainer = container;
+        this.options = {
+            title: undefined,
+            height: '600px',
+            backgroundColor: '#1e293b',
+            upColor: '#00da3c',
+            downColor: '#ec0000',
+            fontColor: '#cbd5e1',
+            fontFamily: 'sans-serif',
+            padding: 0.01,
+            dataZoom: {
+                visible: true,
+                position: 'top',
+                height: 6,
+            },
+            layout: {
+                mainPaneHeight: '50%',
+                gap: 13,
+            },
+            watermark: true,
+            ...options,
+        };
+
+        if (this.options.upColor) this.upColor = this.options.upColor;
+        if (this.options.downColor) this.downColor = this.options.downColor;
+        this.padding = this.options.padding !== undefined ? this.options.padding : this.defaultPadding;
+
+        if (this.options.height) {
+            if (typeof this.options.height === 'number') {
+                this.rootContainer.style.height = `${this.options.height}px`;
+            } else {
+                this.rootContainer.style.height = this.options.height;
+            }
+        }
+
+        // Initialize DOM Layout
+        this.rootContainer.innerHTML = '';
+
+        // Layout Container (Flex Row)
+        this.layoutContainer = document.createElement('div');
+        this.layoutContainer.style.display = 'flex';
+        this.layoutContainer.style.width = '100%';
+        this.layoutContainer.style.height = '100%';
+        this.layoutContainer.style.overflow = 'hidden';
+        this.rootContainer.appendChild(this.layoutContainer);
+
+        // Left Sidebar
+        this.leftSidebar = document.createElement('div');
+        this.leftSidebar.style.display = 'none';
+        this.leftSidebar.style.width = '250px'; // Default width
+        this.leftSidebar.style.flexShrink = '0';
+        this.leftSidebar.style.overflowY = 'auto';
+        this.leftSidebar.style.backgroundColor = this.options.backgroundColor || '#1e293b';
+        this.leftSidebar.style.borderRight = '1px solid #334155';
+        this.leftSidebar.style.padding = '10px';
+        this.leftSidebar.style.boxSizing = 'border-box';
+        this.leftSidebar.style.color = '#cbd5e1';
+        this.leftSidebar.style.fontSize = '12px';
+        this.leftSidebar.style.fontFamily = this.options.fontFamily || 'sans-serif';
+        this.layoutContainer.appendChild(this.leftSidebar);
+
+        // Toolbar Container
+        this.toolbarContainer = document.createElement('div');
+        this.layoutContainer.appendChild(this.toolbarContainer);
+
+        // Chart Container
+        this.chartContainer = document.createElement('div');
+        this.chartContainer.style.flexGrow = '1';
+        this.chartContainer.style.height = '100%';
+        this.chartContainer.style.overflow = 'hidden';
+        this.layoutContainer.appendChild(this.chartContainer);
+
+        // Right Sidebar
+        this.rightSidebar = document.createElement('div');
+        this.rightSidebar.style.display = 'none';
+        this.rightSidebar.style.width = '250px';
+        this.rightSidebar.style.flexShrink = '0';
+        this.rightSidebar.style.overflowY = 'auto';
+        this.rightSidebar.style.backgroundColor = this.options.backgroundColor || '#1e293b';
+        this.rightSidebar.style.borderLeft = '1px solid #334155';
+        this.rightSidebar.style.padding = '10px';
+        this.rightSidebar.style.boxSizing = 'border-box';
+        this.rightSidebar.style.color = '#cbd5e1';
+        this.rightSidebar.style.fontSize = '12px';
+        this.rightSidebar.style.fontFamily = this.options.fontFamily || 'sans-serif';
+        this.layoutContainer.appendChild(this.rightSidebar);
+
+        this.chart = echarts.init(this.chartContainer);
+
+        // Overlay container for table rendering (positioned above ECharts canvas)
+        this.chartContainer.style.position = 'relative';
+        this.overlayContainer = document.createElement('div');
+        this.overlayContainer.style.cssText =
+            'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:100;overflow:hidden;';
+        this.chartContainer.appendChild(this.overlayContainer);
+
+        this.pluginManager = new PluginManager(this, this.toolbarContainer);
+        this.drawingEditor = new DrawingEditor(this);
+
+
+
+        // Bind global chart/ZRender events to the EventBus
+        this.chart.on('dataZoom', (params: any) => {
+            this.events.emit('chart:dataZoom', params);
+
+            // Auto-hide tooltip when dragging chart if triggerOn is 'click' and position is 'floating'
+            const triggerOn = this.options.databox?.triggerOn;
+            const position = this.options.databox?.position;
+            if (triggerOn === 'click' && position === 'floating') {
+                this.chart.dispatchAction({ type: 'hideTip' });
+            }
+
+            // Lazy padding: check if user scrolled near an edge
+            this._checkEdgeAndExpand();
+        });
+        // @ts-ignore - ECharts event handler type mismatch
+        this.chart.on('finished', (params: any) => this.events.emit('chart:updated', params)); // General chart update
+        // @ts-ignore - ECharts ZRender event handler type mismatch
+        this.chart.getZr().on('mousedown', (params: any) => {
+            if (!this._paneDragState) this.events.emit('mouse:down', params);
+        });
+        // @ts-ignore - ECharts ZRender event handler type mismatch
+        this.chart.getZr().on('mousemove', (params: any) => {
+            if (!this._paneDragState) this.events.emit('mouse:move', params);
+        });
+        // @ts-ignore - ECharts ZRender event handler type mismatch
+        this.chart.getZr().on('mouseup', (params: any) => this.events.emit('mouse:up', params));
+        // @ts-ignore - ECharts ZRender event handler type mismatch
+        this.chart.getZr().on('click', (params: any) => {
+            if (!this._paneDragState) this.events.emit('mouse:click', params);
+        });
+
+        const zr = this.chart.getZr();
+        const originalSetCursorStyle = zr.setCursorStyle;
+        const self = this;
+        zr.setCursorStyle = function (cursorStyle: string) {
+            // During pane drag, force row-resize cursor
+            if (self._paneDragState) {
+                originalSetCursorStyle.call(this, 'row-resize');
+                return;
+            }
+            // Change 'grab' (default roam cursor) to  'crosshair' (more suitable for candlestick chart)
+            if (cursorStyle === 'grab') {
+                cursorStyle = 'crosshair';
+            }
+            // Call the original method with your modified style
+            originalSetCursorStyle.call(this, cursorStyle);
+        };
+
+        // Bind Drawing Events
+        this.bindDrawingEvents();
+
+        // Bind pane border drag-resize
+        this.bindPaneResizeEvents();
+
+        window.addEventListener('resize', this.resize.bind(this));
+
+        // Listen for fullscreen change to restore state if exited via ESC
+        document.addEventListener('fullscreenchange', this.onFullscreenChange);
+
+        // Keyboard listener for deletion
+        document.addEventListener('keydown', this.onKeyDown);
+    }
+
+    private onKeyDown = (e: KeyboardEvent) => {
+        if ((e.key === 'Delete' || e.key === 'Backspace') && this.selectedDrawingId) {
+            this.removeDrawing(this.selectedDrawingId);
+            this.selectedDrawingId = null;
+            this.render();
+            // Optional: emit deleted event here or in removeDrawing?
+            // Since removeDrawing is generic, maybe better here if we want 'deleted by user' nuance.
+            // But removeDrawing is called from other places too.
+        }
+    };
+
+    private onFullscreenChange = () => {
+        this.render();
+    };
+
+    // ── Pane border drag-resize ────────────────────────────────
+    private bindPaneResizeEvents(): void {
+        const MIN_MAIN = 10; // minimum main pane height %
+        const MIN_INDICATOR = 5; // minimum indicator pane height %
+        const HIT_ZONE = 6; // hit-zone in pixels (±3px from boundary center)
+
+        const zr = this.chart.getZr();
+
+        /** Find a boundary near the mouse Y position (pixels). */
+        const findBoundary = (mouseY: number): PaneBoundary | null => {
+            if (!this._lastLayout || this._lastLayout.paneBoundaries.length === 0) return null;
+            if (this.maximizedPaneId) return null; // no resize when maximized
+            const containerH = this.chart.getHeight();
+            if (containerH <= 0) return null;
+
+            for (const b of this._lastLayout.paneBoundaries) {
+                const bY = (b.yPercent / 100) * containerH;
+                if (Math.abs(mouseY - bY) <= HIT_ZONE) {
+                    // Don't allow resizing collapsed panes
+                    if (b.aboveId === 'main' && this.isMainCollapsed) continue;
+                    const belowInd = this.indicators.get(b.belowId);
+                    if (belowInd?.collapsed) continue;
+                    if (b.aboveId !== 'main') {
+                        const aboveInd = this.indicators.get(b.aboveId);
+                        if (aboveInd?.collapsed) continue;
+                    }
+                    return b;
+                }
+            }
+            return null;
+        };
+
+        /** Get current height of a pane. */
+        const getPaneHeight = (id: string | 'main'): number => {
+            if (id === 'main') {
+                return this._lastLayout?.mainPaneHeight ?? 50;
+            }
+            const ind = this.indicators.get(id);
+            return ind?.height ?? 15;
+        };
+
+        // --- ZR event handlers ---
+
+        zr.on('mousemove', (e: any) => {
+            if (this._paneDragState) {
+                // Active drag: compute new heights
+                const deltaY = e.offsetY - this._paneDragState.startY;
+                const containerH = this.chart.getHeight();
+                if (containerH <= 0) return;
+                const deltaPct = (deltaY / containerH) * 100;
+
+                const minAbove = this._paneDragState.aboveId === 'main' ? MIN_MAIN : MIN_INDICATOR;
+                const minBelow = MIN_INDICATOR;
+
+                let newAbove = this._paneDragState.startAboveHeight + deltaPct;
+                let newBelow = this._paneDragState.startBelowHeight - deltaPct;
+
+                // Clamp
+                if (newAbove < minAbove) {
+                    newAbove = minAbove;
+                    newBelow = this._paneDragState.startAboveHeight + this._paneDragState.startBelowHeight - minAbove;
+                }
+                if (newBelow < minBelow) {
+                    newBelow = minBelow;
+                    newAbove = this._paneDragState.startAboveHeight + this._paneDragState.startBelowHeight - minBelow;
+                }
+
+                // Apply heights
+                if (this._paneDragState.aboveId === 'main') {
+                    this._mainHeightOverride = newAbove;
+                } else {
+                    const aboveInd = this.indicators.get(this._paneDragState.aboveId);
+                    if (aboveInd) aboveInd.height = newAbove;
+                }
+                const belowInd = this.indicators.get(this._paneDragState.belowId);
+                if (belowInd) belowInd.height = newBelow;
+
+                // Throttle re-render via rAF
+                if (!this._paneResizeRafId) {
+                    this._paneResizeRafId = requestAnimationFrame(() => {
+                        this._paneResizeRafId = null;
+                        this.render();
+                    });
+                }
+
+                // Force row-resize cursor
+                zr.setCursorStyle('row-resize');
+                e.stop?.();
+                return;
+            }
+
+            // Not dragging: check hover over boundary
+            const boundary = findBoundary(e.offsetY);
+            if (boundary) {
+                zr.setCursorStyle('row-resize');
+            }
+        });
+
+        zr.on('mousedown', (e: any) => {
+            const boundary = findBoundary(e.offsetY);
+            if (!boundary) return;
+
+            // Start drag
+            this._paneDragState = {
+                startY: e.offsetY,
+                aboveId: boundary.aboveId,
+                belowId: boundary.belowId,
+                startAboveHeight: getPaneHeight(boundary.aboveId),
+                startBelowHeight: getPaneHeight(boundary.belowId),
+            };
+
+            zr.setCursorStyle('row-resize');
+            e.stop?.();
+        });
+
+        zr.on('mouseup', () => {
+            if (this._paneDragState) {
+                this._paneDragState = null;
+                if (this._paneResizeRafId) {
+                    cancelAnimationFrame(this._paneResizeRafId);
+                    this._paneResizeRafId = null;
+                }
+                this.render();
+            }
+        });
+    }
+
+    private bindDrawingEvents() {
+        let hideTimeout: any = null;
+        let lastHoveredGroup: any = null;
+
+        // Helper to get drawing info
+        const getDrawingInfo = (params: any) => {
+            if (!params || params.componentType !== 'series' || !params.seriesName?.startsWith('drawings')) {
+                return null;
+            }
+
+            // Find the drawing
+            const paneIndex = params.seriesIndex; // We can't rely on seriesIndex to find pane index easily as it shifts.
+            // But we named the series "drawings-pane-{index}".
+            const match = params.seriesName.match(/drawings-pane-(\d+)/);
+            if (!match) return null;
+
+            const paneIdx = parseInt(match[1]);
+
+            // We stored drawings for this pane in render(), but here we access the flat list?
+            // Wait, params.dataIndex is the index in the filtered array passed to that series.
+            // We need to re-find the drawing or store metadata.
+            // In render(), we map `drawingsByPane`.
+
+            // Efficient way: Re-filter to get the specific drawing.
+            // Assuming the order in render() is preserved.
+            const paneDrawings = this.drawings.filter((d) => (d.paneIndex || 0) === paneIdx);
+            const drawing = paneDrawings[params.dataIndex];
+
+            if (!drawing) return null;
+
+            // Check target for specific part (line or point)
+            // ECharts event params.event.target is the graphic element
+            const targetName = params.event?.target?.name; // 'line', 'point-start', 'point-end'
+
+            return { drawing, targetName, paneIdx };
+        };
+
+        this.chart.on('mouseover', (params: any) => {
+            const info = getDrawingInfo(params);
+            if (!info) return;
+
+            // Handle visibility of points
+            const group = params.event?.target?.parent;
+            if (group) {
+                // If the drawing is selected, we don't want hover to mess with opacity
+                // However, the user might be hovering a DIFFERENT drawing.
+                // Let's check the drawing ID from 'info'.
+                const isSelected = info.drawing.id === this.selectedDrawingId;
+
+                if (hideTimeout) {
+                    clearTimeout(hideTimeout);
+                    hideTimeout = null;
+                }
+
+                // Show points if not selected (if selected, they are already visible)
+                if (!isSelected) {
+                    group.children().forEach((child: any) => {
+                        if (child.name && child.name.startsWith('point')) {
+                            child.attr('style', { opacity: 1 });
+                        }
+                    });
+                }
+
+                // Handle switching groups
+                if (lastHoveredGroup && lastHoveredGroup !== group) {
+                    // Check if last group belongs to the selected drawing?
+                    // We don't have easy access to the drawing ID of 'lastHoveredGroup' unless we stored it.
+                    // But we can just iterate and hide points.
+                    // Wait, if lastHoveredGroup IS the selected drawing, we should NOT hide points.
+                    // We need to know if lastHoveredGroup corresponds to selected drawing.
+                    // Storing 'lastHoveredDrawingId' would be better.
+                    // Simple fix: We rely on the render() logic which sets opacity: 1 for selected.
+                    // If we manually set opacity: 0 via ZRender attr, it might override the initial render state?
+                    // Yes, ZRender elements are persistent until re-render.
+                    // So we must be careful not to hide points of the selected drawing.
+                    // But we don't know the ID of lastHoveredGroup here easily.
+                    // Let's modify the hide logic to be safer.
+                }
+                lastHoveredGroup = group;
+            }
+
+            if (info.targetName === 'line') {
+                this.events.emit('drawing:hover', {
+                    id: info.drawing.id,
+                    type: info.drawing.type,
+                });
+                // Set cursor
+                this.chart.getZr().setCursorStyle('move');
+            } else if (info.targetName?.startsWith('point-')) {
+                const pointIdx = parseInt(info.targetName.split('-')[1]) || 0;
+                this.events.emit('drawing:point:hover', {
+                    id: info.drawing.id,
+                    pointIndex: pointIdx,
+                });
+                this.chart.getZr().setCursorStyle('pointer');
+            }
+        });
+
+        this.chart.on('mouseout', (params: any) => {
+            const info = getDrawingInfo(params);
+            if (!info) return;
+
+            // Hide points (with slight delay or check)
+            const group = params.event?.target?.parent;
+
+            // If selected, do not hide points
+            if (info.drawing.id === this.selectedDrawingId) {
+                // Keep points visible
+                return;
+            }
+
+            // Delay hide to allow moving between siblings
+            hideTimeout = setTimeout(() => {
+                if (group) {
+                    // Check selection again inside timeout just in case
+                    if (this.selectedDrawingId === info.drawing.id) return;
+
+                    group.children().forEach((child: any) => {
+                        if (child.name && child.name.startsWith('point')) {
+                            child.attr('style', { opacity: 0 });
+                        }
+                    });
+                }
+                if (lastHoveredGroup === group) {
+                    lastHoveredGroup = null;
+                }
+            }, 50);
+
+            if (info.targetName === 'line') {
+                this.events.emit('drawing:mouseout', { id: info.drawing.id });
+            } else if (info.targetName?.startsWith('point-')) {
+                const pointIdx = parseInt(info.targetName.split('-')[1]) || 0;
+                this.events.emit('drawing:point:mouseout', {
+                    id: info.drawing.id,
+                    pointIndex: pointIdx,
+                });
+            }
+            this.chart.getZr().setCursorStyle('default');
+        });
+
+        this.chart.on('mousedown', (params: any) => {
+            const info = getDrawingInfo(params);
+            if (!info) return;
+
+            const event = params.event?.event || params.event;
+            const x = event?.offsetX;
+            const y = event?.offsetY;
+
+            if (info.targetName === 'line') {
+                this.events.emit('drawing:mousedown', {
+                    id: info.drawing.id,
+                    x,
+                    y,
+                });
+            } else if (info.targetName?.startsWith('point-')) {
+                const pointIdx = parseInt(info.targetName.split('-')[1]) || 0;
+                this.events.emit('drawing:point:mousedown', {
+                    id: info.drawing.id,
+                    pointIndex: pointIdx,
+                    x,
+                    y,
+                });
+            }
+        });
+
+        this.chart.on('click', (params: any) => {
+            const info = getDrawingInfo(params);
+            if (!info) return;
+
+            // Select Drawing logic
+            if (this.selectedDrawingId !== info.drawing.id) {
+                this.selectedDrawingId = info.drawing.id;
+                this.events.emit('drawing:selected', { id: info.drawing.id });
+                this.render(); // Re-render to update opacity permanent state
+            }
+
+            if (info.targetName === 'line') {
+                this.events.emit('drawing:click', { id: info.drawing.id });
+            } else if (info.targetName?.startsWith('point-')) {
+                const pointIdx = parseInt(info.targetName.split('-')[1]) || 0;
+                this.events.emit('drawing:point:click', {
+                    id: info.drawing.id,
+                    pointIndex: pointIdx,
+                });
+            }
+        });
+
+        // Background click to deselect
+        this.chart.getZr().on('click', (params: any) => {
+            // If target is undefined or not part of a drawing series we know...
+            if (!params.target) {
+                if (this.selectedDrawingId) {
+                    this.events.emit('drawing:deselected', { id: this.selectedDrawingId });
+                    this.selectedDrawingId = null;
+                    this.render();
+                }
+            }
+        });
+
+        // --- Label Tooltip ---
+        // Create floating tooltip overlay for Pine Script label.set_tooltip()
+        this._labelTooltipEl = document.createElement('div');
+        this._labelTooltipEl.style.cssText =
+            'position:absolute;display:none;pointer-events:none;z-index:200;' +
+            'background:rgba(30,41,59,0.95);color:#fff;border:1px solid #475569;' +
+            'border-radius:4px;padding:6px 10px;font-size:12px;line-height:1.5;' +
+            'white-space:pre-wrap;max-width:350px;box-shadow:0 2px 8px rgba(0,0,0,0.3);' +
+            'font-family:' +
+            (this.options.fontFamily || 'sans-serif') +
+            ';';
+        this.chartContainer.appendChild(this._labelTooltipEl);
+
+        // Show tooltip on scatter item hover (labels with tooltip text)
+        this.chart.on('mouseover', { seriesType: 'scatter' }, (params: any) => {
+            const tooltipText = params.data?._tooltipText;
+            if (!tooltipText || !this._labelTooltipEl) return;
+
+            this._labelTooltipEl.textContent = tooltipText;
+            this._labelTooltipEl.style.display = 'block';
+
+            // Position below the scatter point
+            const chartRect = this.chartContainer.getBoundingClientRect();
+            const event = params.event?.event;
+            if (event) {
+                const x = event.clientX - chartRect.left;
+                const y = event.clientY - chartRect.top;
+                // Show below and slightly left of cursor
+                const tipWidth = this._labelTooltipEl.offsetWidth;
+                const left = Math.min(x - tipWidth / 2, chartRect.width - tipWidth - 8);
+                this._labelTooltipEl.style.left = Math.max(4, left) + 'px';
+                this._labelTooltipEl.style.top = y + 18 + 'px';
+            }
+        });
+
+        this.chart.on('mouseout', { seriesType: 'scatter' }, () => {
+            if (this._labelTooltipEl) {
+                this._labelTooltipEl.style.display = 'none';
+            }
+        });
+    }
+
+    // --- Plugin System Integration ---
+
+    public getChart(): echarts.ECharts {
+        return this.chart;
+    }
+
+    public getMarketData(): OHLCV[] {
+        return this.marketData;
+    }
+
+    public getTimeToIndex(): Map<number, number> {
+        return this.timeToIndex;
+    }
+
+    public getOptions(): QFChartOptions {
+        return this.options;
+    }
+
+    public disableTools(): void {
+        this.pluginManager.deactivatePlugin();
+    }
+
+    public registerPlugin(plugin: Plugin): void {
+        this.pluginManager.register(plugin);
+    }
+
+    public registerDrawingRenderer(renderer: DrawingRenderer): void {
+        this.drawingRenderers.register(renderer);
+    }
+
+    public snapToCandle(point: { x: number; y: number }): { x: number; y: number } {
+        // Find which pane the point is in
+        const dataCoord = this.coordinateConversion.pixelToData(point);
+        if (!dataCoord) return point;
+
+        const paneIndex = dataCoord.paneIndex || 0;
+        // Only snap on the main pane (candlestick data)
+        if (paneIndex !== 0) return point;
+
+        // Get the nearest candle by time index
+        const realIndex = Math.round(dataCoord.timeIndex);
+        if (realIndex < 0 || realIndex >= this.marketData.length) return point;
+
+        const candle = this.marketData[realIndex];
+        if (!candle) return point;
+
+        // Snap X to the exact candle center
+        const snappedX = this.chart.convertToPixel(
+            { gridIndex: paneIndex },
+            [realIndex + this.dataIndexOffset, candle.close],
+        );
+        if (!snappedX) return point;
+        const snapPxX = snappedX[0];
+
+        // Find closest OHLC value by Y distance
+        const ohlc = [candle.open, candle.high, candle.low, candle.close];
+        let bestValue = ohlc[0];
+        let bestDist = Infinity;
+
+        for (const val of ohlc) {
+            const px = this.chart.convertToPixel(
+                { gridIndex: paneIndex },
+                [realIndex + this.dataIndexOffset, val],
+            );
+            if (px) {
+                const dist = Math.abs(px[1] - point.y);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestValue = val;
+                }
+            }
+        }
+
+        const snappedY = this.chart.convertToPixel(
+            { gridIndex: paneIndex },
+            [realIndex + this.dataIndexOffset, bestValue],
+        );
+
+        return {
+            x: snapPxX,
+            y: snappedY ? snappedY[1] : point.y,
+        };
+    }
+
+    // --- Drawing System ---
+
+    public addDrawing(drawing: import('./types').DrawingElement): void {
+        this.drawings.push(drawing);
+        this.render(); // Re-render to show new drawing
+    }
+
+    public removeDrawing(id: string): void {
+        const index = this.drawings.findIndex((d) => d.id === id);
+        if (index !== -1) {
+            const drawing = this.drawings[index];
+            this.drawings.splice(index, 1);
+            this.events.emit('drawing:deleted', { id: drawing.id });
+            this.render();
+        }
+    }
+
+    public getDrawing(id: string): import('./types').DrawingElement | undefined {
+        return this.drawings.find((d) => d.id === id);
+    }
+
+    public updateDrawing(drawing: import('./types').DrawingElement): void {
+        const index = this.drawings.findIndex((d) => d.id === drawing.id);
+        if (index !== -1) {
+            this.drawings[index] = drawing;
+            this.render();
+        }
+    }
+
+    // --- Interaction Locking ---
+
+    private isLocked: boolean = false;
+    private lockedState: any = null;
+
+    public lockChart(): void {
+        if (this.isLocked) return;
+        this.isLocked = true;
+
+        const option = this.chart.getOption() as any;
+
+        // Store current state to restore later if needed (though setOption merge handles most)
+        // Actually, simply disabling interactions is enough.
+
+        // We update the option to disable dataZoom and tooltip
+        this.chart.setOption({
+            dataZoom: option.dataZoom.map((dz: any) => ({ ...dz, disabled: true })),
+            tooltip: { show: false }, // Hide tooltip during drag
+            // We can also disable series interaction if needed, but custom series is handled by us.
+        });
+    }
+
+    public unlockChart(): void {
+        if (!this.isLocked) return;
+        this.isLocked = false;
+
+        const option = this.chart.getOption() as any;
+
+        // Restore interactions
+        // We assume dataZoom was enabled before. If not, we might re-enable it wrongly.
+        // Ideally we should restore from 'options' or check the previous state.
+        // Since 'render' rebuilds everything from 'this.options', we can just call render?
+        // But render is expensive.
+        // Better: Re-enable based on this.options.
+
+        // Re-enable dataZoom
+        const dzConfig = this.options.dataZoom || {};
+        const dzVisible = dzConfig.visible ?? true;
+
+        // We can map over current option.dataZoom and set disabled: false
+        if (option.dataZoom) {
+            this.chart.setOption({
+                dataZoom: option.dataZoom.map((dz: any) => ({
+                    ...dz,
+                    disabled: false,
+                })),
+                tooltip: { show: true },
+            });
+        }
+    }
+
+    // --------------------------------
+
+    public setZoom(start: number, end: number): void {
+        this.chart.dispatchAction({
+            type: 'dataZoom',
+            start,
+            end,
+        });
+    }
+
+    public setMarketData(data: OHLCV[]): void {
+        this.marketData = data;
+        this.rebuildTimeIndex();
+        this.render();
+    }
+
+    /**
+     * Update market data incrementally without full re-render
+     * Merges new/updated OHLCV data with existing data by timestamp
+     *
+     * @param data - Array of OHLCV data to merge
+     *
+     * @remarks
+     * **Performance Optimization**: This method only triggers a chart update if the data array contains
+     * new or modified bars. If an empty array is passed, no update occurs (expected behavior).
+     *
+     * **Usage Pattern for Updating Indicators**:
+     * When updating both market data and indicators, follow this order:
+     *
+     * 1. Update indicator data first using `indicator.updateData(plots)`
+     * 2. Then call `chart.updateData(newBars)` with the new/modified market data
+     *
+     * The chart update will trigger a re-render that includes the updated indicator data.
+     *
+     * **Important**: If you update indicator data without updating market data (e.g., recalculation
+     * with same bars), you must still call `chart.updateData([...])` with at least one bar
+     * to trigger the re-render. Calling with an empty array will NOT trigger an update.
+     *
+     * @example
+     * ```typescript
+     * // Step 1: Update indicator data
+     * macdIndicator.updateData({
+     *   macd: { data: [{ time: 1234567890, value: 150 }], options: { style: 'line', color: '#2962FF' } }
+     * });
+     *
+     * // Step 2: Update market data (triggers re-render with new indicator data)
+     * chart.updateData([
+     *   { time: 1234567890, open: 100, high: 105, low: 99, close: 103, volume: 1000 }
+     * ]);
+     * ```
+     *
+     * @example
+     * ```typescript
+     * // If only updating existing bar (e.g., real-time tick updates):
+     * const lastBar = { ...existingBar, close: newPrice, high: Math.max(existingBar.high, newPrice) };
+     * chart.updateData([lastBar]); // Updates by timestamp
+     * ```
+     */
+    public updateData(data: OHLCV[]): void {
+        if (data.length === 0) return;
+
+        // Build a map of existing data by time for O(1) lookups
+        const existingTimeMap = new Map<number, OHLCV>();
+        this.marketData.forEach((bar) => {
+            existingTimeMap.set(bar.time, bar);
+        });
+
+        // Track if we added new data or only updated existing
+        let hasNewData = false;
+
+        // Merge new data
+        data.forEach((bar) => {
+            if (!existingTimeMap.has(bar.time)) {
+                hasNewData = true;
+            }
+            existingTimeMap.set(bar.time, bar);
+        });
+
+        // Rebuild marketData array sorted by time
+        this.marketData = Array.from(existingTimeMap.values()).sort((a, b) => a.time - b.time);
+
+        // Update timeToIndex map
+        this.rebuildTimeIndex();
+
+        // Use pre-calculated padding points from rebuildTimeIndex
+        const paddingPoints = this.dataIndexOffset;
+
+        // Build candlestick data with padding
+        const candlestickSeries = SeriesBuilder.buildCandlestickSeries(this.marketData, this.options);
+        const emptyCandle = { value: [NaN, NaN, NaN, NaN], itemStyle: { opacity: 0 } };
+        const paddedCandlestickData = [
+            ...Array(paddingPoints).fill(emptyCandle),
+            ...candlestickSeries.data,
+            ...Array(paddingPoints).fill(emptyCandle),
+        ];
+
+        // Build category data with padding
+        const categoryData = [
+            ...Array(paddingPoints).fill(''),
+            ...this.marketData.map((k) => new Date(k.time).toLocaleString()),
+            ...Array(paddingPoints).fill(''),
+        ];
+
+        // Build indicator series data
+        const currentOption = this.chart.getOption() as any;
+        const layout = LayoutManager.calculate(
+            this.chart.getHeight(),
+            this.indicators,
+            this.options,
+            this.isMainCollapsed,
+            this.maximizedPaneId,
+            this.marketData,
+            this._mainHeightOverride ?? undefined,
+        );
+        this._lastLayout = layout;
+
+        // Pass full padded candlestick data for shape positioning
+        // But SeriesBuilder expects 'OHLCV[]', while paddedCandlestickData is array of arrays [open,close,low,high]
+        // We need to pass the raw marketData but ALIGNED with padding?
+        // Or better, pass the processed OHLCV array?
+        // Let's pass the raw marketData, but SeriesBuilder needs to handle the padding internally or we pass padded data?
+        // SeriesBuilder.buildIndicatorSeries iterates over 'totalDataLength' (which includes padding) and uses 'dataIndexOffset'.
+        // So passing 'this.marketData' is not enough because index 0 in marketData corresponds to 'paddingPoints' index in chart.
+        // We should pass an array that aligns with chart indices.
+        // Let's reconstruct an array of objects {high, low} that includes padding.
+
+        const paddedOHLCVForShapes = [...Array(paddingPoints).fill(null), ...this.marketData, ...Array(paddingPoints).fill(null)];
+
+        const { series: indicatorSeries, barColors } = SeriesBuilder.buildIndicatorSeries(
+            this.indicators,
+            this.timeToIndex,
+            layout.paneLayout,
+            categoryData.length,
+            paddingPoints,
+            paddedOHLCVForShapes, // Pass padded OHLCV data
+            layout.overlayYAxisMap, // Pass overlay Y-axis mapping
+            layout.separatePaneYAxisOffset, // Pass Y-axis offset for separate panes
+        );
+
+        // Apply barColors to candlestick data
+        // TradingView behavior: barcolor() only changes body fill; borders/wicks keep default colors (green/red)
+        const coloredCandlestickData = paddedCandlestickData.map((candle: any, i: number) => {
+            if (barColors[i]) {
+                const vals = candle.value || candle;
+                return {
+                    value: vals,
+                    itemStyle: {
+                        color: barColors[i], // up-candle body fill
+                        color0: barColors[i], // down-candle body fill
+                        // borderColor/borderColor0 intentionally omitted → inherits series default (green/red)
+                    },
+                };
+            }
+            return candle;
+        });
+
+        // Build drawing range hints for Y-axis scaling
+        const updateDrawingRangeHints = this._buildDrawingRangeHints(layout, paddingPoints);
+
+        // Update only the data arrays in the option, not the full config
+        const updateOption: any = {
+            xAxis: currentOption.xAxis.map((axis: any, index: number) => ({
+                data: categoryData,
+            })),
+            series: [
+                {
+                    data: coloredCandlestickData,
+                    markLine: candlestickSeries.markLine, // Ensure markLine is updated
+                },
+                ...indicatorSeries,
+                ...updateDrawingRangeHints,
+            ],
+        };
+
+        // Merge the update (don't replace entire config)
+        this.chart.setOption(updateOption, { notMerge: false });
+
+        // Re-render table overlays (indicators may have updated table data)
+        const allTables: any[] = [];
+        this.indicators.forEach((indicator) => {
+            Object.values(indicator.plots).forEach((plot: any) => {
+                if (plot.options?.style === 'table') {
+                    plot.data?.forEach((entry: any) => {
+                        const tables = Array.isArray(entry.value) ? entry.value : [entry.value];
+                        tables.forEach((t: any) => {
+                            if (t && !t._deleted) {
+                                // Tag table with its indicator's pane for correct positioning
+                                t._paneIndex = t.force_overlay ? 0 : indicator.paneIndex;
+                                allTables.push(t);
+                            }
+                        });
+                    });
+                }
+            });
+        });
+        this._lastTables = allTables;
+        this._renderTableOverlays();
+
+        // Update countdown if needed
+        this.startCountdown();
+    }
+
+    private startCountdown() {
+        // Stop existing timer
+        this.stopCountdown();
+
+        if (!this.options.lastPriceLine?.showCountdown || this.marketData.length === 0) {
+            return;
+        }
+
+        // Auto-detect interval from market data if not explicitly set
+        let interval = this.options.interval;
+        if (!interval && this.marketData.length >= 2) {
+            const last = this.marketData[this.marketData.length - 1];
+            const prev = this.marketData[this.marketData.length - 2];
+            interval = last.time - prev.time;
+        }
+        if (!interval) return;
+
+        const updateLabel = () => {
+            if (this.marketData.length === 0) return;
+            const lastBar = this.marketData[this.marketData.length - 1];
+            const nextCloseTime = lastBar.time + interval!;
+            const now = Date.now();
+            const diff = nextCloseTime - now;
+
+            if (diff <= 0) {
+                // Timer expired (bar closed), maybe wait for next update
+                // Or show 00:00:00
+                return;
+            }
+
+            // Format time
+            const absDiff = Math.abs(diff);
+            const hours = Math.floor(absDiff / 3600000);
+            const minutes = Math.floor((absDiff % 3600000) / 60000);
+            const seconds = Math.floor((absDiff % 60000) / 1000);
+
+            const timeString = `${hours > 0 ? hours.toString().padStart(2, '0') + ':' : ''}${minutes.toString().padStart(2, '0')}:${seconds
+                .toString()
+                .padStart(2, '0')}`;
+
+            // Update markLine label
+            // We need to find the candlestick series index (usually 0)
+            // But we can update by name if unique, or by index. SeriesBuilder sets name to options.title or 'Market'
+            // Safest is to modify the option directly for series index 0 (if that's where candle is)
+            // Or better, check current option
+            const currentOption = this.chart.getOption() as any;
+            if (!currentOption || !currentOption.series) return;
+
+            // Find candlestick series (type 'candlestick')
+            const candleSeriesIndex = currentOption.series.findIndex((s: any) => s.type === 'candlestick');
+            if (candleSeriesIndex === -1) return;
+
+            const candleSeries = currentOption.series[candleSeriesIndex];
+            if (!candleSeries.markLine || !candleSeries.markLine.data || !candleSeries.markLine.data[0]) return;
+
+            const markLineData = candleSeries.markLine.data[0];
+            const currentFormatter = markLineData.label.formatter;
+
+            // We need to preserve the price formatting logic.
+            // But formatter is a function in the option we passed, but ECharts might have stored it?
+            // ECharts getOption() returns the merged option. Functions are preserved.
+            // We can wrap the formatter or just use the price value.
+            // markLineData.yAxis is the price.
+
+            const price = markLineData.yAxis;
+            let priceStr = '';
+
+            // Re-use formatting logic from options if possible, or auto-detect decimals
+            if (this.options.yAxisLabelFormatter) {
+                priceStr = this.options.yAxisLabelFormatter(price);
+            } else {
+                const decimals =
+                    this.options.yAxisDecimalPlaces !== undefined ? this.options.yAxisDecimalPlaces : AxisUtils.autoDetectDecimals(this.marketData);
+                priceStr = AxisUtils.formatValue(price, decimals);
+            }
+
+            const labelText = `${priceStr}\n${timeString}`;
+
+            // Reconstruct the markLine data to preserve styles (lineStyle, symbol, etc.)
+            // We spread markLineData to keep everything (including lineStyle which defines color),
+            // then overwrite the label to update the formatter/text.
+
+            this.chart.setOption({
+                series: [
+                    {
+                        id: '__candlestick__',
+                        markLine: {
+                            data: [
+                                {
+                                    ...markLineData, // Preserve lineStyle (color), symbol, yAxis, etc.
+                                    label: {
+                                        ...markLineData.label, // Preserve existing label styles including backgroundColor
+                                        formatter: labelText, // Update only the text
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                ],
+            });
+        };
+
+        // Run immediately
+        updateLabel();
+
+        // Start interval
+        this.countdownInterval = setInterval(updateLabel, 1000);
+    }
+
+    private stopCountdown() {
+        if (this.countdownInterval) {
+            clearInterval(this.countdownInterval);
+            this.countdownInterval = null;
+        }
+    }
+
+    public addIndicator(
+        id: string,
+        plots: { [name: string]: IndicatorPlot },
+        options: {
+            overlay?: boolean;
+            /** @deprecated Use overlay instead */
+            isOverlay?: boolean;
+            height?: number;
+            titleColor?: string;
+            controls?: { collapse?: boolean; maximize?: boolean };
+        } = {},
+    ): Indicator {
+        // Handle backward compatibility: prefer 'overlay' over 'isOverlay'
+        const isOverlay = options.overlay !== undefined ? options.overlay : (options.isOverlay ?? false);
+        let paneIndex = 0;
+        if (!isOverlay) {
+            // Find the next available pane index
+            // Start from 1, as 0 is the main chart
+            let maxPaneIndex = 0;
+            this.indicators.forEach((ind) => {
+                if (ind.paneIndex > maxPaneIndex) {
+                    maxPaneIndex = ind.paneIndex;
+                }
+            });
+            paneIndex = maxPaneIndex + 1;
+        }
+
+        // Create Indicator object
+        const indicator = new Indicator(id, plots, paneIndex, {
+            height: options.height,
+            collapsed: false,
+            titleColor: options.titleColor,
+            controls: options.controls,
+        });
+
+        this.indicators.set(id, indicator);
+        this.render();
+        return indicator;
+    }
+
+    /** @deprecated Use addIndicator instead */
+    public setIndicator(id: string, plot: IndicatorPlot, isOverlay: boolean = false): void {
+        // Wrap single plot into the new structure (backward compatibility)
+        this.addIndicator(id, { [id]: plot }, { overlay: isOverlay });
+    }
+
+    public removeIndicator(id: string): void {
+        this.indicators.delete(id);
+        this.render();
+    }
+
+    public toggleIndicator(id: string, action: 'collapse' | 'maximize' | 'fullscreen' = 'collapse'): void {
+        if (action === 'fullscreen') {
+            if (document.fullscreenElement) {
+                document.exitFullscreen();
+            } else {
+                this.rootContainer.requestFullscreen();
+            }
+            return;
+        }
+
+        if (action === 'maximize') {
+            if (this.maximizedPaneId === id) {
+                // Restore
+                this.maximizedPaneId = null;
+            } else {
+                // Maximize
+                this.maximizedPaneId = id;
+            }
+            this.render();
+            return;
+        }
+
+        if (id === 'main') {
+            this.isMainCollapsed = !this.isMainCollapsed;
+            this.render();
+            return;
+        }
+        const indicator = this.indicators.get(id);
+        if (indicator) {
+            indicator.toggleCollapse();
+            this.render();
+        }
+    }
+
+    public resize(): void {
+        this.chart.resize();
+        this._renderTableOverlays();
+    }
+
+    /**
+     * Build invisible "scatter" series that carry the min/max Y values of Pine
+     * Script drawing objects (lines, boxes, labels, polylines).  ECharts includes
+     * these points in its automatic Y-axis range calculation so drawings below
+     * or above the candlestick range are no longer clipped.
+     *
+     * Returns one hidden series per pane that has drawing objects with Y-values
+     * outside the default data range.
+     */
+    private _buildDrawingRangeHints(layout: any, paddingPoints: number): any[] {
+        const hintSeries: any[] = [];
+
+        // Collect Y-value bounds per pane from all indicator drawing objects
+        const boundsPerPane = new Map<number, { yMin: number; yMax: number }>();
+
+        for (const indicator of this.indicators) {
+            if (!indicator.plots) continue;
+            const paneIndex = indicator.paneIndex ?? 0;
+            if (!boundsPerPane.has(paneIndex)) {
+                boundsPerPane.set(paneIndex, { yMin: Infinity, yMax: -Infinity });
+            }
+            const bounds = boundsPerPane.get(paneIndex)!;
+
+            for (const [plotName, plot] of Object.entries(indicator.plots as Record<string, any>)) {
+                if (!plot || !plot.options) continue;
+                const style = plot.options?.style;
+
+                // Lines: y1, y2
+                if (style === 'drawing_line' && plot.data) {
+                    for (const entry of plot.data) {
+                        const items = entry?.value ? (Array.isArray(entry.value) ? entry.value : [entry.value]) : [];
+                        for (const ln of items) {
+                            if (!ln || ln._deleted) continue;
+                            if (typeof ln.y1 === 'number' && isFinite(ln.y1)) {
+                                bounds.yMin = Math.min(bounds.yMin, ln.y1);
+                                bounds.yMax = Math.max(bounds.yMax, ln.y1);
+                            }
+                            if (typeof ln.y2 === 'number' && isFinite(ln.y2)) {
+                                bounds.yMin = Math.min(bounds.yMin, ln.y2);
+                                bounds.yMax = Math.max(bounds.yMax, ln.y2);
+                            }
+                        }
+                    }
+                }
+
+                // Boxes: top, bottom
+                if (style === 'drawing_box' && plot.data) {
+                    for (const entry of plot.data) {
+                        const items = entry?.value ? (Array.isArray(entry.value) ? entry.value : [entry.value]) : [];
+                        for (const bx of items) {
+                            if (!bx || bx._deleted) continue;
+                            if (typeof bx.top === 'number' && isFinite(bx.top)) {
+                                bounds.yMin = Math.min(bounds.yMin, bx.top);
+                                bounds.yMax = Math.max(bounds.yMax, bx.top);
+                            }
+                            if (typeof bx.bottom === 'number' && isFinite(bx.bottom)) {
+                                bounds.yMin = Math.min(bounds.yMin, bx.bottom);
+                                bounds.yMax = Math.max(bounds.yMax, bx.bottom);
+                            }
+                        }
+                    }
+                }
+
+                // Labels: y
+                if (style === 'label' && plot.data) {
+                    for (const entry of plot.data) {
+                        const items = entry?.value ? (Array.isArray(entry.value) ? entry.value : [entry.value]) : [];
+                        for (const lbl of items) {
+                            if (!lbl || lbl._deleted) continue;
+                            if (typeof lbl.y === 'number' && isFinite(lbl.y)) {
+                                bounds.yMin = Math.min(bounds.yMin, lbl.y);
+                                bounds.yMax = Math.max(bounds.yMax, lbl.y);
+                            }
+                        }
+                    }
+                }
+
+                // Polylines: points[].price
+                if (style === 'drawing_polyline' && plot.data) {
+                    for (const entry of plot.data) {
+                        const items = entry?.value ? (Array.isArray(entry.value) ? entry.value : [entry.value]) : [];
+                        for (const pl of items) {
+                            if (!pl || pl._deleted || !pl._points) continue;
+                            for (const pt of pl._points) {
+                                if (typeof pt?.price === 'number' && isFinite(pt.price)) {
+                                    bounds.yMin = Math.min(bounds.yMin, pt.price);
+                                    bounds.yMax = Math.max(bounds.yMax, pt.price);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Create a hidden scatter series per pane with min/max Y values
+        const midIndex = paddingPoints + Math.floor((this.marketData?.length || 0) / 2);
+        boundsPerPane.forEach((bounds, paneIndex) => {
+            if (!isFinite(bounds.yMin) || !isFinite(bounds.yMax)) return;
+
+            // Determine Y-axis index for this pane
+            const yAxisIndex = paneIndex === 0
+                ? 0
+                : (layout.separatePaneYAxisOffset || 1) + (paneIndex - 1);
+
+            hintSeries.push({
+                name: `_drawingRange_pane${paneIndex}`,
+                type: 'scatter',
+                xAxisIndex: paneIndex,
+                yAxisIndex,
+                symbol: 'none',
+                symbolSize: 0,
+                silent: true,
+                animation: false,
+                // Two invisible points at min and max Y — ECharts includes them in axis scaling
+                data: [
+                    [midIndex, bounds.yMin],
+                    [midIndex, bounds.yMax],
+                ],
+                tooltip: { show: false },
+            });
+        });
+
+        return hintSeries;
+    }
+
+    /**
+     * Build table canvas graphic elements from the current _lastTables.
+     * Must be called AFTER setOption so grid rects are available from ECharts.
+     * Returns an array of ECharts graphic elements.
+     */
+    private _buildTableGraphics(): any[] {
+        const model = this.chart.getModel() as any;
+        const getGridRect = (paneIndex: number) => model.getComponent('grid', paneIndex)?.coordinateSystem?.getRect();
+        const elements = TableCanvasRenderer.buildGraphicElements(this._lastTables, getGridRect);
+        // Assign stable IDs for future merge/replace
+        this._tableGraphicIds = [];
+        for (let i = 0; i < elements.length; i++) {
+            const id = `__qf_table_${i}`;
+            elements[i].id = id;
+            this._tableGraphicIds.push(id);
+        }
+        return elements;
+    }
+
+    /**
+     * Render table overlays after a non-replacing setOption (updateData, resize).
+     * Uses replaceMerge to cleanly replace all graphic elements without disrupting
+     * other interactive components (dataZoom, tooltip, etc.).
+     */
+    private _renderTableOverlays(): void {
+        // Build new table graphics
+        const tableGraphics = this._buildTableGraphics();
+
+        // Combine base graphics (title, watermark) + table graphics and replace all at once.
+        // Using replaceMerge: ['graphic'] replaces ONLY the graphic component,
+        // leaving dataZoom, tooltip, series etc. untouched.
+        const allGraphics = [...this._baseGraphics, ...tableGraphics];
+        this.chart.setOption({ graphic: allGraphics }, { replaceMerge: ['graphic'] } as any);
+
+        // Clear DOM overlays (legacy) — keep overlay container empty
+        TableOverlayRenderer.clearAll(this.overlayContainer);
+    }
+
+    public destroy(): void {
+        this.stopCountdown();
+        window.removeEventListener('resize', this.resize.bind(this));
+        document.removeEventListener('fullscreenchange', this.onFullscreenChange);
+        document.removeEventListener('keydown', this.onKeyDown);
+        this.pluginManager.deactivatePlugin(); // Cleanup active tool
+        this.pluginManager.destroy(); // Cleanup tooltips
+        this.chart.dispose();
+    }
+
+    private rebuildTimeIndex(): void {
+        this.timeToIndex.clear();
+        this.marketData.forEach((k, index) => {
+            this.timeToIndex.set(k.time, index);
+        });
+
+        // Calculate initial padding from user-configured ratio
+        const dataLength = this.marketData.length;
+        const initialPadding = Math.ceil(dataLength * this.padding);
+
+        // _paddingPoints can only grow (lazy expansion), never shrink below initial or minimum
+        this._paddingPoints = Math.max(this._paddingPoints, initialPadding, this.LAZY_MIN_PADDING);
+        this.dataIndexOffset = this._paddingPoints;
+    }
+
+    /**
+     * Expand symmetric padding to the given number of points per side.
+     * No-op if newPaddingPoints <= current. Performs a full render() and
+     * restores the viewport position so there is no visual jump.
+     */
+    public expandPadding(newPaddingPoints: number): void {
+        this._resizePadding(newPaddingPoints);
+    }
+
+    /**
+     * Resize symmetric padding to the given number of points per side.
+     * Works for both growing and shrinking. Clamps to [min, max].
+     * Uses merge-mode setOption to preserve drag/interaction state.
+     */
+    private _resizePadding(newPaddingPoints: number): void {
+        // Clamp to bounds
+        const initialPadding = Math.ceil(this.marketData.length * this.padding);
+        newPaddingPoints = Math.max(newPaddingPoints, initialPadding, this.LAZY_MIN_PADDING);
+        newPaddingPoints = Math.min(newPaddingPoints, this.LAZY_MAX_PADDING);
+        if (newPaddingPoints === this._paddingPoints) return;
+
+        // 1. Capture current viewport as absolute bar indices
+        const oldPadding = this._paddingPoints;
+        const oldTotal = this.marketData.length + 2 * oldPadding;
+        const currentOption = this.chart.getOption() as any;
+        const zoomComp = currentOption?.dataZoom?.find((dz: any) => dz.type === 'slider' || dz.type === 'inside');
+        const oldStartIdx = zoomComp ? (zoomComp.start / 100) * oldTotal : 0;
+        const oldEndIdx = zoomComp ? (zoomComp.end / 100) * oldTotal : oldTotal;
+
+        // 2. Update padding state (delta can be positive or negative)
+        const delta = newPaddingPoints - oldPadding;
+        this._paddingPoints = newPaddingPoints;
+        this.dataIndexOffset = this._paddingPoints;
+        const paddingPoints = this._paddingPoints;
+
+        // 3. Rebuild all data arrays with new padding
+        const emptyCandle = { value: [NaN, NaN, NaN, NaN], itemStyle: { opacity: 0 } };
+        const candlestickSeries = SeriesBuilder.buildCandlestickSeries(this.marketData, this.options);
+        const paddedCandlestickData = [
+            ...Array(paddingPoints).fill(emptyCandle),
+            ...candlestickSeries.data,
+            ...Array(paddingPoints).fill(emptyCandle),
+        ];
+        const categoryData = [
+            ...Array(paddingPoints).fill(''),
+            ...this.marketData.map((k) => new Date(k.time).toLocaleString()),
+            ...Array(paddingPoints).fill(''),
+        ];
+        const paddedOHLCVForShapes = [...Array(paddingPoints).fill(null), ...this.marketData, ...Array(paddingPoints).fill(null)];
+
+        // Rebuild indicator series with new offset
+        const layout = LayoutManager.calculate(
+            this.chart.getHeight(),
+            this.indicators,
+            this.options,
+            this.isMainCollapsed,
+            this.maximizedPaneId,
+            this.marketData,
+            this._mainHeightOverride ?? undefined,
+        );
+        const { series: indicatorSeries, barColors } = SeriesBuilder.buildIndicatorSeries(
+            this.indicators,
+            this.timeToIndex,
+            layout.paneLayout,
+            categoryData.length,
+            paddingPoints,
+            paddedOHLCVForShapes,
+            layout.overlayYAxisMap,
+            layout.separatePaneYAxisOffset,
+        );
+
+        // Apply barColors (TradingView: barcolor() only changes body fill, borders/wicks stay default)
+        const coloredCandlestickData = paddedCandlestickData.map((candle: any, i: number) => {
+            if (barColors[i]) {
+                const vals = candle.value || candle;
+                return {
+                    value: vals,
+                    itemStyle: {
+                        color: barColors[i],
+                        color0: barColors[i],
+                    },
+                };
+            }
+            return candle;
+        });
+
+        // 4. Calculate corrected zoom for new total length
+        const newTotal = this.marketData.length + 2 * newPaddingPoints;
+        const newStart = Math.max(0, ((oldStartIdx + delta) / newTotal) * 100);
+        const newEnd = Math.min(100, ((oldEndIdx + delta) / newTotal) * 100);
+
+        // 5. Rebuild drawing series data with new offset so ECharts
+        //    viewport culling uses correct padded indices after expansion.
+        const drawingSeriesUpdates: any[] = [];
+        const drawingsByPane = new Map<number, import('./types').DrawingElement[]>();
+        this.drawings.forEach((d) => {
+            const paneIdx = d.paneIndex || 0;
+            if (!drawingsByPane.has(paneIdx)) drawingsByPane.set(paneIdx, []);
+            drawingsByPane.get(paneIdx)!.push(d);
+        });
+        drawingsByPane.forEach((paneDrawings) => {
+            drawingSeriesUpdates.push({
+                data: paneDrawings.map((d) => {
+                    const row: number[] = [];
+                    d.points.forEach((p) => {
+                        row.push(p.timeIndex + this.dataIndexOffset, p.value);
+                    });
+                    return row;
+                }),
+            });
+        });
+
+        // 6. Merge update — preserves drag/interaction state
+        const updateOption: any = {
+            xAxis: currentOption.xAxis.map(() => ({ data: categoryData })),
+            dataZoom: (currentOption.dataZoom || []).map(() => ({
+                start: newStart, end: newEnd,
+            })),
+            series: [
+                { data: coloredCandlestickData, markLine: candlestickSeries.markLine },
+                ...indicatorSeries.map((s) => {
+                    const update: any = { data: s.data };
+                    if (s.renderItem) update.renderItem = s.renderItem;
+                    return update;
+                }),
+                ...drawingSeriesUpdates,
+            ],
+        };
+        this.chart.setOption(updateOption, { notMerge: false });
+    }
+
+    /**
+     * Check if user scrolled near an edge (expand) or away from edges (contract).
+     * Uses requestAnimationFrame to avoid cascading re-renders inside
+     * the ECharts dataZoom event callback.
+     */
+    private _checkEdgeAndExpand(): void {
+        if (this._expandScheduled) return;
+
+        const zoomComp = (this.chart.getOption() as any)?.dataZoom?.find((dz: any) => dz.type === 'slider' || dz.type === 'inside');
+        if (!zoomComp) return;
+
+        const paddingPoints = this._paddingPoints;
+        const dataLength = this.marketData.length;
+        const totalLength = dataLength + 2 * paddingPoints;
+        const startIdx = Math.round((zoomComp.start / 100) * totalLength);
+        const endIdx = Math.round((zoomComp.end / 100) * totalLength);
+
+        // Count visible real candles (overlap between viewport and data range)
+        const dataStart = paddingPoints;
+        const dataEnd = paddingPoints + dataLength - 1;
+        const visibleCandles = Math.max(0, Math.min(endIdx, dataEnd) - Math.max(startIdx, dataStart) + 1);
+
+        const nearLeftEdge = startIdx < this.LAZY_EDGE_THRESHOLD;
+        const nearRightEdge = endIdx > totalLength - this.LAZY_EDGE_THRESHOLD;
+
+        // Don't expand when zoomed in very tight (fewer than 3 visible candles)
+        if ((nearLeftEdge || nearRightEdge) && paddingPoints < this.LAZY_MAX_PADDING && visibleCandles >= 3) {
+            this._expandScheduled = true;
+            requestAnimationFrame(() => {
+                this._expandScheduled = false;
+                this._resizePadding(paddingPoints + this.LAZY_CHUNK_SIZE);
+            });
+            return;
+        }
+
+        // Contract if far from both edges and padding is larger than needed
+        // Calculate how many padding bars are visible/near-visible on each side
+        const leftPadUsed = Math.max(0, paddingPoints - startIdx);
+        const rightPadUsed = Math.max(0, endIdx - (paddingPoints + dataLength - 1));
+        const neededPadding = Math.max(
+            leftPadUsed + this.LAZY_CHUNK_SIZE, // keep one chunk of buffer
+            rightPadUsed + this.LAZY_CHUNK_SIZE,
+        );
+
+        // Only contract if we have at least one full chunk of excess
+        if (paddingPoints > neededPadding + this.LAZY_CHUNK_SIZE) {
+            this._expandScheduled = true;
+            requestAnimationFrame(() => {
+                this._expandScheduled = false;
+                this._resizePadding(neededPadding);
+            });
+        }
+    }
+
+    private render(): void {
+        if (this.marketData.length === 0) return;
+
+        // Capture current zoom state before rebuilding options
+        let currentZoomState: { start: number; end: number } | null = null;
+        try {
+            const currentOption = this.chart.getOption() as any;
+            if (currentOption && currentOption.dataZoom && currentOption.dataZoom.length > 0) {
+                // Find the slider or inside zoom component that controls the x-axis
+                const zoomComponent = currentOption.dataZoom.find((dz: any) => dz.type === 'slider' || dz.type === 'inside');
+                if (zoomComponent) {
+                    currentZoomState = {
+                        start: zoomComponent.start,
+                        end: zoomComponent.end,
+                    };
+                }
+            }
+        } catch (e) {
+            // Chart might not be initialized yet
+        }
+
+        // --- Sidebar Layout Management ---
+        const tooltipPos = this.options.databox?.position; // undefined if not present
+        const prevLeftDisplay = this.leftSidebar.style.display;
+        const prevRightDisplay = this.rightSidebar.style.display;
+
+        // If tooltipPos is undefined, we hide both sidebars and don't use them for tooltips.
+        // We only show sidebars if position is explicitly 'left' or 'right'.
+
+        const newLeftDisplay = tooltipPos === 'left' ? 'block' : 'none';
+        const newRightDisplay = tooltipPos === 'right' ? 'block' : 'none';
+
+        // Only resize if visibility changed to avoid unnecessary reflows/resizes
+        if (prevLeftDisplay !== newLeftDisplay || prevRightDisplay !== newRightDisplay) {
+            this.leftSidebar.style.display = newLeftDisplay;
+            this.rightSidebar.style.display = newRightDisplay;
+            this.chart.resize();
+        }
+        // ---------------------------------
+
+        // Use pre-calculated padding points from rebuildTimeIndex
+        const paddingPoints = this.dataIndexOffset;
+
+        // Create extended category data with empty labels for padding
+        const categoryData = [
+            ...Array(paddingPoints).fill(''), // Left padding
+            ...this.marketData.map((k) => new Date(k.time).toLocaleString()),
+            ...Array(paddingPoints).fill(''), // Right padding
+        ];
+
+        // 1. Calculate Layout
+        const layout = LayoutManager.calculate(
+            this.chart.getHeight(),
+            this.indicators,
+            this.options,
+            this.isMainCollapsed,
+            this.maximizedPaneId,
+            this.marketData,
+            this._mainHeightOverride ?? undefined,
+        );
+        this._lastLayout = layout;
+
+        // Convert user-provided dataZoom start/end to account for padding
+        // User's start/end refer to real data (0% = start of real data, 100% = end of real data)
+        // We need to convert to padded data coordinates
+        if (!currentZoomState && layout.dataZoom && this.marketData.length > 0) {
+            const realDataLength = this.marketData.length;
+            const totalLength = categoryData.length; // includes padding on both sides
+            const paddingRatio = paddingPoints / totalLength;
+            const dataRatio = realDataLength / totalLength;
+
+            layout.dataZoom.forEach((dz) => {
+                // Convert user's start/end (0-100 referring to real data) to actual start/end (0-100 referring to padded data)
+                if (dz.start !== undefined) {
+                    // User's start% of real data -> actual position in padded data
+                    const userStartFraction = dz.start / 100;
+                    const actualStartFraction = paddingRatio + userStartFraction * dataRatio;
+                    dz.start = actualStartFraction * 100;
+                }
+                if (dz.end !== undefined) {
+                    // User's end% of real data -> actual position in padded data
+                    const userEndFraction = dz.end / 100;
+                    const actualEndFraction = paddingRatio + userEndFraction * dataRatio;
+                    dz.end = actualEndFraction * 100;
+                }
+            });
+        }
+
+        // Apply preserved zoom state if available (this overrides the conversion above)
+        if (currentZoomState && layout.dataZoom) {
+            layout.dataZoom.forEach((dz) => {
+                dz.start = currentZoomState!.start;
+                dz.end = currentZoomState!.end;
+            });
+        }
+
+        // Patch X-Axis with extended data
+        layout.xAxis.forEach((axis) => {
+            axis.data = categoryData;
+            axis.boundaryGap = false; // No additional gap needed, we have phantom data
+        });
+
+        // 2. Build Series with phantom data padding
+        const candlestickSeries = SeriesBuilder.buildCandlestickSeries(this.marketData, this.options);
+        // Extend candlestick data with empty objects (not null) to avoid rendering errors
+        const emptyCandle = { value: [NaN, NaN, NaN, NaN], itemStyle: { opacity: 0 } };
+        candlestickSeries.data = [...Array(paddingPoints).fill(emptyCandle), ...candlestickSeries.data, ...Array(paddingPoints).fill(emptyCandle)];
+
+        // Build array of OHLCV aligned with indices for shape positioning
+        const paddedOHLCVForShapes = [...Array(paddingPoints).fill(null), ...this.marketData, ...Array(paddingPoints).fill(null)];
+
+        const { series: indicatorSeries, barColors } = SeriesBuilder.buildIndicatorSeries(
+            this.indicators,
+            this.timeToIndex,
+            layout.paneLayout,
+            categoryData.length,
+            paddingPoints,
+            paddedOHLCVForShapes, // Pass padded OHLCV
+            layout.overlayYAxisMap, // Pass overlay Y-axis mapping
+            layout.separatePaneYAxisOffset, // Pass Y-axis offset for separate panes
+        );
+
+        // Create hidden range-hint series so Pine Script drawing objects
+        // (lines, boxes, labels, polylines) contribute to Y-axis auto-scaling.
+        const drawingRangeHints = this._buildDrawingRangeHints(layout, paddingPoints);
+
+        // Apply barColors (TradingView: barcolor() only changes body fill, borders/wicks stay default)
+        candlestickSeries.data = candlestickSeries.data.map((candle: any, i: number) => {
+            if (barColors[i]) {
+                const vals = candle.value || candle;
+                return {
+                    value: vals,
+                    itemStyle: {
+                        color: barColors[i],
+                        color0: barColors[i],
+                    },
+                };
+            }
+            return candle;
+        });
+
+        // 3. Build Graphics
+        const overlayIndicators: { id: string; titleColor?: string }[] = [];
+        this.indicators.forEach((ind, id) => {
+            if (ind.paneIndex === 0) {
+                overlayIndicators.push({ id, titleColor: ind.titleColor });
+            }
+        });
+        const graphic = GraphicBuilder.build(
+            layout,
+            this.options,
+            this.toggleIndicator.bind(this),
+            this.isMainCollapsed,
+            this.maximizedPaneId,
+            overlayIndicators,
+        );
+
+        // 4. Build Drawings Series (One Custom Series per Pane used)
+        const drawingsByPane = new Map<number, import('./types').DrawingElement[]>();
+        this.drawings.forEach((d) => {
+            const paneIdx = d.paneIndex || 0;
+            if (!drawingsByPane.has(paneIdx)) {
+                drawingsByPane.set(paneIdx, []);
+            }
+            drawingsByPane.get(paneIdx)!.push(d);
+        });
+
+        const drawingSeriesList: any[] = [];
+        drawingsByPane.forEach((drawings, paneIndex) => {
+            drawingSeriesList.push({
+                type: 'custom',
+                name: `drawings-pane-${paneIndex}`,
+                xAxisIndex: paneIndex,
+                yAxisIndex: paneIndex,
+                clip: true,
+                renderItem: (params: any, api: any) => {
+                    const drawing = drawings[params.dataIndex];
+                    if (!drawing) return;
+
+                    const renderer = this.drawingRenderers.get(drawing.type);
+                    if (!renderer) return;
+
+                    const drawingOffset = this.dataIndexOffset;
+                    const pixelPoints = drawing.points.map(
+                        (p) => api.coord([p.timeIndex + drawingOffset, p.value]) as [number, number],
+                    );
+
+                    return renderer.render({
+                        drawing,
+                        pixelPoints,
+                        isSelected: drawing.id === this.selectedDrawingId,
+                        api,
+                        coordSys: params.coordSys,
+                    });
+                },
+                data: drawings.map((d) => {
+                    const row: number[] = [];
+                    d.points.forEach((p) => {
+                        row.push(p.timeIndex + this.dataIndexOffset, p.value);
+                    });
+                    return row;
+                }),
+                encode: (() => {
+                    const maxPoints = drawings.reduce((max, d) => Math.max(max, d.points.length), 0);
+                    const xDims = Array.from({ length: maxPoints }, (_, i) => i * 2);
+                    const yDims = Array.from({ length: maxPoints }, (_, i) => i * 2 + 1);
+                    return { x: xDims, y: yDims };
+                })(),
+                z: 100,
+                silent: false,
+            });
+        });
+
+        // 5. Tooltip Formatter
+        const tooltipFormatter = (params: any[]) => {
+            const html = TooltipFormatter.format(params, this.options);
+            const mode = this.options.databox?.position; // undefined if not present
+
+            if (mode === 'left') {
+                this.leftSidebar.innerHTML = html;
+                return ''; // Hide tooltip box
+            }
+            if (mode === 'right') {
+                this.rightSidebar.innerHTML = html;
+                return ''; // Hide tooltip box
+            }
+
+            if (!this.options.databox) {
+                return ''; // No tooltip content
+            }
+
+            // Default to floating if databox exists but position is 'floating' (or unspecified but object exists)
+            return `<div style="min-width: 200px;">${html}</div>`;
+        };
+
+        // 6. Extract and render table overlays from indicator plots
+        const allTables: any[] = [];
+        this.indicators.forEach((indicator) => {
+            Object.values(indicator.plots).forEach((plot: any) => {
+                if (plot.options?.style === 'table') {
+                    plot.data?.forEach((entry: any) => {
+                        const tables = Array.isArray(entry.value) ? entry.value : [entry.value];
+                        tables.forEach((t: any) => {
+                            if (t && !t._deleted) {
+                                // Tag table with its indicator's pane for correct positioning
+                                t._paneIndex = t.force_overlay ? 0 : indicator.paneIndex;
+                                allTables.push(t);
+                            }
+                        });
+                    });
+                }
+            });
+        });
+        const option: any = {
+            backgroundColor: this.options.backgroundColor,
+            animation: false,
+            legend: {
+                show: false, // Hide default legend as we use tooltip
+            },
+            tooltip: {
+                show: true,
+                showContent: !!this.options.databox, // Show content only if databox is present
+                trigger: 'axis',
+                triggerOn: this.options.databox?.triggerOn ?? 'mousemove', // Control when to show tooltip/crosshair
+                axisPointer: { type: 'cross', label: { backgroundColor: '#475569' } },
+                backgroundColor: 'rgba(30, 41, 59, 0.9)',
+                borderWidth: 1,
+                borderColor: '#334155',
+                padding: 10,
+                textStyle: {
+                    color: '#fff',
+                    fontFamily: this.options.fontFamily || 'sans-serif',
+                },
+                formatter: tooltipFormatter,
+                extraCssText: tooltipPos !== 'floating' && tooltipPos !== undefined ? 'display: none !important;' : undefined,
+                position: (pos: any, params: any, el: any, elRect: any, size: any) => {
+                    const mode = this.options.databox?.position;
+                    if (mode === 'floating') {
+                        const obj = { top: 10 };
+                        obj[['left', 'right'][+(pos[0] < size.viewSize[0] / 2)] as keyof typeof obj] = 30;
+                        return obj;
+                    }
+                    return null;
+                },
+            },
+            axisPointer: {
+                link: { xAxisIndex: 'all' },
+                label: { backgroundColor: '#475569' },
+            },
+            graphic: graphic,
+            grid: layout.grid,
+            xAxis: layout.xAxis,
+            yAxis: layout.yAxis,
+            dataZoom: layout.dataZoom,
+            series: [candlestickSeries, ...indicatorSeries, ...drawingRangeHints, ...drawingSeriesList],
+        };
+
+        this.chart.setOption(option, true); // true = not merge, replace.
+
+        // Store base graphics (title, watermark, pane labels) for later re-use
+        // in _renderTableOverlays so we can do a clean replaceMerge.
+        this._baseGraphics = graphic;
+
+        // Render table graphics AFTER setOption so we can query the computed grid rects.
+        // Uses replaceMerge to cleanly set all graphics without disrupting interactive components.
+        this._lastTables = allTables;
+        if (allTables.length > 0) {
+            const tableGraphics = this._buildTableGraphics();
+            if (tableGraphics.length > 0) {
+                const allGraphics = [...graphic, ...tableGraphics];
+                this.chart.setOption({ graphic: allGraphics }, { replaceMerge: ['graphic'] } as any);
+            }
+        } else {
+            this._tableGraphicIds = [];
+        }
+
+        // Clear DOM overlays (legacy)
+        TableOverlayRenderer.clearAll(this.overlayContainer);
+    }
+}

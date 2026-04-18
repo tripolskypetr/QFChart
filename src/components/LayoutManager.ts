@@ -1,0 +1,779 @@
+import { QFChartOptions, Indicator as IndicatorType, OHLCV } from '../types';
+import { AxisUtils } from '../utils/AxisUtils';
+
+export interface PaneConfiguration {
+    index: number;
+    height: number;
+    top: number;
+    isCollapsed: boolean;
+    indicatorId?: string;
+    titleColor?: string;
+    controls?: {
+        collapse?: boolean;
+        maximize?: boolean;
+    };
+}
+
+export interface PaneBoundary {
+    yPercent: number; // Y position in %, center of the gap between panes
+    aboveId: string | 'main'; // pane above (main chart or indicator id)
+    belowId: string; // indicator id below
+}
+
+export interface LayoutResult {
+    grid: any[];
+    xAxis: any[];
+    yAxis: any[];
+    dataZoom: any[];
+    paneLayout: PaneConfiguration[];
+    mainPaneHeight: number;
+    mainPaneTop: number;
+    pixelToPercent: number;
+    paneBoundaries: PaneBoundary[];
+}
+
+export class LayoutManager {
+    public static calculate(
+        containerHeight: number,
+        indicators: Map<string, IndicatorType>,
+        options: QFChartOptions,
+        isMainCollapsed: boolean = false,
+        maximizedPaneId: string | null = null,
+        marketData?: import('../types').OHLCV[],
+        mainHeightOverride?: number,
+    ): LayoutResult & { overlayYAxisMap: Map<string, number>; separatePaneYAxisOffset: number } {
+        // Calculate pixelToPercent early for maximized logic
+        let pixelToPercent = 0;
+        if (containerHeight > 0) {
+            pixelToPercent = (1 / containerHeight) * 100;
+        }
+
+        // Get Y-axis padding percentage (default 5%)
+        const yAxisPaddingPercent = options.yAxisPadding !== undefined ? options.yAxisPadding : 5;
+
+        // Grid styling options
+        const gridShow = options.grid?.show === true; // default false
+        const gridLineColor = options.grid?.lineColor ?? '#334155';
+        const gridLineOpacity = options.grid?.lineOpacity ?? 0.5;
+        const gridBorderColor = options.grid?.borderColor ?? '#334155';
+        const gridBorderShow = options.grid?.borderShow === true; // default false
+
+        // Layout margin options
+        const layoutLeft = options.layout?.left ?? '10%';
+        const layoutRight = options.layout?.right ?? '10%';
+
+        // Identify unique separate panes (indices > 0) and sort them
+        const separatePaneIndices = Array.from(indicators.values())
+            .map((ind) => ind.paneIndex)
+            .filter((idx) => idx > 0)
+            .sort((a, b) => a - b)
+            .filter((value, index, self) => self.indexOf(value) === index); // Unique
+
+        const hasSeparatePane = separatePaneIndices.length > 0;
+
+        // DataZoom Configuration
+        const dzVisible = options.dataZoom?.visible ?? true;
+        const dzPosition = options.dataZoom?.position ?? 'top';
+        const dzHeight = options.dataZoom?.height ?? 6;
+        const dzStart = options.dataZoom?.start ?? 0;
+        const dzEnd = options.dataZoom?.end ?? 100;
+
+        // Layout Calculation
+        let mainPaneTop = 8;
+        let chartAreaBottom = 92; // Default if no dataZoom at bottom
+
+        // Maximized State Logic
+        let maximizeTargetIndex = -1; // -1 = none
+
+        if (maximizedPaneId) {
+            if (maximizedPaneId === 'main') {
+                maximizeTargetIndex = 0;
+            } else {
+                const ind = indicators.get(maximizedPaneId);
+                if (ind) {
+                    maximizeTargetIndex = ind.paneIndex;
+                }
+            }
+        }
+
+        if (maximizeTargetIndex !== -1) {
+            // Special Layout for Maximize
+            // We must generate grid/axis definitions for ALL indices to maintain series mapping,
+            // but hide the non-maximized ones.
+
+            const grid: any[] = [];
+            const xAxis: any[] = [];
+            const yAxis: any[] = [];
+            const dataZoom: any[] = []; // Hide slider, keep inside?
+
+            // DataZoom: keep inside, maybe slider if main?
+            // Let's keep strict maximize: Full container.
+            // Use defaults for maximize if not available, or preserve logic?
+            // The calculateMaximized doesn't use LayoutManager.calculate directly but inline logic.
+            // It should probably respect the same zoom?
+            // But here we are inside LayoutManager.calculate.
+
+            const dzStart = options.dataZoom?.start ?? 50;
+            const dzEnd = options.dataZoom?.end ?? 100;
+
+            // Add 'inside' zoom only if zoomOnTouch is enabled (default true)
+            const zoomOnTouch = options.dataZoom?.zoomOnTouch ?? true;
+            if (zoomOnTouch) {
+                dataZoom.push({ type: 'inside', xAxisIndex: 'all', start: dzStart, end: dzEnd, filterMode: 'weakFilter' });
+            }
+
+            // Need to know total panes to iterate
+            const maxPaneIndex = hasSeparatePane ? Math.max(...separatePaneIndices) : 0;
+
+            const paneConfigs: PaneConfiguration[] = []; // For GraphicBuilder title placement
+
+            // Iterate 0 to maxPaneIndex
+            for (let i = 0; i <= maxPaneIndex; i++) {
+                const isTarget = i === maximizeTargetIndex;
+
+                // Grid
+                grid.push({
+                    left: layoutLeft,
+                    right: layoutRight,
+                    top: isTarget ? '5%' : '0%',
+                    height: isTarget ? '90%' : '0%',
+                    show: isTarget,
+                    containLabel: false,
+                });
+
+                // X-Axis
+                xAxis.push({
+                    type: 'category',
+                    gridIndex: i,
+                    data: [],
+                    show: isTarget,
+                    axisLabel: {
+                        show: isTarget,
+                        color: '#94a3b8',
+                        fontFamily: options.fontFamily,
+                    },
+                    axisLine: { show: isTarget && gridBorderShow, lineStyle: { color: gridBorderColor } },
+                    splitLine: {
+                        show: isTarget && gridShow,
+                        lineStyle: { color: gridLineColor, opacity: gridLineOpacity },
+                    },
+                });
+
+                // Y-Axis
+                // For maximized pane 0 (main), respect custom min/max if provided
+                let yMin: any;
+                let yMax: any;
+
+                if (i === 0 && maximizeTargetIndex === 0) {
+                    // Main pane is maximized, use custom values if provided
+                    yMin =
+                        options.yAxisMin !== undefined && options.yAxisMin !== 'auto'
+                            ? options.yAxisMin
+                            : AxisUtils.createMinFunction(yAxisPaddingPercent);
+                    yMax =
+                        options.yAxisMax !== undefined && options.yAxisMax !== 'auto'
+                            ? options.yAxisMax
+                            : AxisUtils.createMaxFunction(yAxisPaddingPercent);
+                } else {
+                    // Separate panes always use dynamic scaling
+                    yMin = AxisUtils.createMinFunction(yAxisPaddingPercent);
+                    yMax = AxisUtils.createMaxFunction(yAxisPaddingPercent);
+                }
+
+                yAxis.push({
+                    position: 'right',
+                    gridIndex: i,
+                    show: isTarget,
+                    scale: true,
+                    min: yMin,
+                    max: yMax,
+                    axisLabel: {
+                        show: isTarget,
+                        color: '#94a3b8',
+                        fontFamily: options.fontFamily,
+                        formatter: (value: number) => {
+                            if (options.yAxisLabelFormatter) {
+                                return options.yAxisLabelFormatter(value);
+                            }
+                            const decimals =
+                                options.yAxisDecimalPlaces !== undefined
+                                    ? options.yAxisDecimalPlaces
+                                    : AxisUtils.autoDetectDecimals(marketData as OHLCV[]);
+                            return AxisUtils.formatValue(value, decimals);
+                        },
+                    },
+                    splitLine: {
+                        show: isTarget && gridShow,
+                        lineStyle: { color: gridLineColor, opacity: gridLineOpacity },
+                    },
+                });
+
+                // Reconstruct Pane Config for GraphicBuilder
+                // We need to return `paneLayout` so GraphicBuilder can draw the Restore button
+                if (i > 0) {
+                    // Find indicator for this pane
+                    const ind = Array.from(indicators.values()).find((ind) => ind.paneIndex === i);
+                    if (ind) {
+                        paneConfigs.push({
+                            index: i,
+                            height: isTarget ? 90 : 0,
+                            top: isTarget ? 5 : 0,
+                            isCollapsed: false,
+                            indicatorId: ind.id,
+                            titleColor: ind.titleColor,
+                            controls: ind.controls,
+                        });
+                    }
+                }
+            }
+
+            return {
+                grid,
+                xAxis,
+                yAxis,
+                dataZoom,
+                paneLayout: paneConfigs,
+                mainPaneHeight: maximizeTargetIndex === 0 ? 90 : 0,
+                mainPaneTop: maximizeTargetIndex === 0 ? 5 : 0,
+                pixelToPercent,
+                overlayYAxisMap: new Map(), // No overlays in maximized view
+                separatePaneYAxisOffset: 1, // In maximized view, no overlays, so separate panes start at 1
+            };
+        }
+
+        if (dzVisible) {
+            if (dzPosition === 'top') {
+                // DataZoom takes top 0% to dzHeight%
+                // Main chart starts below it with a small gap
+                mainPaneTop = dzHeight + 4; // dzHeight + 4% gap
+                chartAreaBottom = 95; // Use more space at bottom since slider is gone
+            } else {
+                // DataZoom takes bottom
+                // Chart ends at 100 - dzHeight - margin
+                chartAreaBottom = 100 - dzHeight - 2;
+                mainPaneTop = 8;
+            }
+        } else {
+            // No data zoom
+            mainPaneTop = 5;
+            chartAreaBottom = 95;
+        }
+
+        // We need to calculate height distribution dynamically to avoid overlap.
+        // Calculate gap in percent
+        let gapPercent = 5;
+        if (containerHeight > 0) {
+            gapPercent = (20 / containerHeight) * 100;
+        }
+
+        let mainHeightVal = 75; // Default if no separate pane
+
+        // Parse layout.mainPaneHeight option (e.g. '40%' or 40)
+        let configuredMainHeight: number | undefined;
+        if (options.layout?.mainPaneHeight !== undefined) {
+            const raw = options.layout.mainPaneHeight;
+            if (typeof raw === 'string') {
+                const parsed = parseFloat(raw);
+                if (!isNaN(parsed)) configuredMainHeight = parsed;
+            } else if (typeof raw === 'number') {
+                configuredMainHeight = raw as unknown as number;
+            }
+        }
+
+        // Prepare separate panes configuration
+        let paneConfigs: PaneConfiguration[] = [];
+
+        if (hasSeparatePane) {
+            // Resolve heights for all separate panes
+            // 1. Identify panes and their requested heights
+            const panes = separatePaneIndices.map((idx) => {
+                const ind = Array.from(indicators.values()).find((i) => i.paneIndex === idx);
+                return {
+                    index: idx,
+                    requestedHeight: ind?.height,
+                    isCollapsed: ind?.collapsed ?? false,
+                    indicatorId: ind?.id,
+                    titleColor: ind?.titleColor,
+                    controls: ind?.controls,
+                };
+            });
+
+            // 2. Assign raw heights (collapsed = 3%, otherwise use requested or default 15)
+            const rawPanes = panes.map((p) => ({
+                ...p,
+                rawHeight: p.isCollapsed ? 3 : p.requestedHeight !== undefined ? p.requestedHeight : 15,
+            }));
+
+            const totalAvailable = chartAreaBottom - mainPaneTop;
+            const totalGaps = rawPanes.length * gapPercent;
+
+            // 4. Determine main chart height
+            if (mainHeightOverride !== undefined && mainHeightOverride > 0 && !isMainCollapsed) {
+                // Drag-resize takes absolute priority
+                mainHeightVal = mainHeightOverride;
+            } else if (isMainCollapsed) {
+                mainHeightVal = 3;
+            } else if (configuredMainHeight !== undefined && configuredMainHeight > 0) {
+                // User set mainPaneHeight — indicators fill remaining space proportionally
+                mainHeightVal = configuredMainHeight;
+            } else {
+                // Auto: subtract indicator heights from available space
+                const totalIndicatorHeight = rawPanes.reduce((sum, p) => sum + p.rawHeight, 0);
+                mainHeightVal = totalAvailable - totalIndicatorHeight - totalGaps;
+                if (mainHeightVal < 20) mainHeightVal = Math.max(mainHeightVal, 10);
+            }
+
+            // 3. Resolve indicator heights
+            // When mainPaneHeight is configured (or drag override active), distribute remaining space
+            // proportionally among non-collapsed panes using their rawHeight as weights.
+            const isMainHeightFixed = (mainHeightOverride !== undefined && mainHeightOverride > 0 && !isMainCollapsed)
+                || (configuredMainHeight !== undefined && configuredMainHeight > 0 && !isMainCollapsed);
+
+            type ResolvedPane = (typeof rawPanes)[number] & { height: number };
+            let resolvedPanes: ResolvedPane[];
+            if (isMainHeightFixed) {
+                const remainingForIndicators = totalAvailable - mainHeightVal - totalGaps;
+                const totalWeights = rawPanes
+                    .filter((p) => !p.isCollapsed)
+                    .reduce((sum, p) => sum + p.rawHeight, 0);
+                resolvedPanes = rawPanes.map((p) => ({
+                    ...p,
+                    height: p.isCollapsed
+                        ? 3
+                        : totalWeights > 0
+                            ? Math.max(5, (p.rawHeight / totalWeights) * remainingForIndicators)
+                            : remainingForIndicators / rawPanes.filter((x) => !x.isCollapsed).length,
+                }));
+            } else {
+                resolvedPanes = rawPanes.map((p) => ({ ...p, height: p.rawHeight }));
+            }
+
+            // 5. Calculate positions
+            let currentTop = mainPaneTop + mainHeightVal + gapPercent;
+
+            paneConfigs = resolvedPanes.map((p) => {
+                const config = {
+                    index: p.index,
+                    height: p.height,
+                    top: currentTop,
+                    isCollapsed: p.isCollapsed,
+                    indicatorId: p.indicatorId,
+                    titleColor: p.titleColor,
+                    controls: p.controls,
+                };
+                currentTop += p.height + gapPercent;
+                return config;
+            });
+        } else {
+            // No secondary panes — mainPaneHeight is ignored, fill all available space
+            mainHeightVal = chartAreaBottom - mainPaneTop;
+            if (isMainCollapsed) {
+                mainHeightVal = 3;
+            }
+        }
+
+        // --- Build pane boundaries for drag-resize ---
+        const paneBoundaries: PaneBoundary[] = [];
+        if (paneConfigs.length > 0) {
+            // Boundary between main chart and first indicator
+            paneBoundaries.push({
+                yPercent: mainPaneTop + mainHeightVal + gapPercent / 2,
+                aboveId: 'main',
+                belowId: paneConfigs[0].indicatorId || '',
+            });
+            // Boundaries between consecutive indicators
+            for (let i = 0; i < paneConfigs.length - 1; i++) {
+                paneBoundaries.push({
+                    yPercent: paneConfigs[i].top + paneConfigs[i].height + gapPercent / 2,
+                    aboveId: paneConfigs[i].indicatorId || '',
+                    belowId: paneConfigs[i + 1].indicatorId || '',
+                });
+            }
+        }
+
+        // --- Generate Grids ---
+        const grid: any[] = [];
+        // Main Grid (index 0)
+        grid.push({
+            left: layoutLeft,
+            right: layoutRight,
+            top: mainPaneTop + '%',
+            height: mainHeightVal + '%',
+            containLabel: false, // We handle margins explicitly
+        });
+
+        // Separate Panes Grids
+        paneConfigs.forEach((pane) => {
+            grid.push({
+                left: layoutLeft,
+                right: layoutRight,
+                top: pane.top + '%',
+                height: pane.height + '%',
+                containLabel: false,
+            });
+        });
+
+        // --- Generate X-Axes ---
+        const allXAxisIndices = [0, ...paneConfigs.map((_, i) => i + 1)];
+        const xAxis: any[] = [];
+
+        // Main X-Axis
+        // Hide date labels on the main chart when indicator panes exist below —
+        // the bottom-most pane's x-axis will show them instead.
+        const isMainBottom = paneConfigs.length === 0;
+        const showMainXLabels = !isMainCollapsed && isMainBottom;
+        xAxis.push({
+            type: 'category',
+            data: [], // Will be filled by SeriesBuilder or QFChart
+            gridIndex: 0,
+            scale: true,
+            // boundaryGap will be set in QFChart.ts based on padding option
+            axisLine: {
+                onZero: false,
+                show: !isMainCollapsed && gridBorderShow,
+                lineStyle: { color: gridBorderColor },
+            },
+            splitLine: {
+                show: !isMainCollapsed && gridShow,
+                lineStyle: { color: gridLineColor, opacity: gridLineOpacity },
+            },
+            axisLabel: {
+                show: showMainXLabels,
+                color: '#94a3b8',
+                fontFamily: options.fontFamily || 'sans-serif',
+                formatter: (value: number) => {
+                    if (options.yAxisLabelFormatter) {
+                        return options.yAxisLabelFormatter(value);
+                    }
+                    const decimals =
+                        options.yAxisDecimalPlaces !== undefined ? options.yAxisDecimalPlaces : AxisUtils.autoDetectDecimals(marketData as OHLCV[]);
+                    return AxisUtils.formatValue(value, decimals);
+                },
+            },
+            axisTick: { show: showMainXLabels },
+            axisPointer: {
+                label: {
+                    show: isMainBottom,
+                    fontSize: 11,
+                    backgroundColor: '#475569',
+                },
+            },
+        });
+
+        // Separate Panes X-Axes
+        // Show date labels only on the bottom-most pane
+        paneConfigs.forEach((pane, i) => {
+            const isBottom = i === paneConfigs.length - 1;
+            const showLabels = isBottom && !pane.isCollapsed;
+            xAxis.push({
+                type: 'category',
+                gridIndex: i + 1, // 0 is main
+                data: [], // Shared data
+                axisLabel: {
+                    show: showLabels,
+                    color: '#94a3b8',
+                    fontFamily: options.fontFamily || 'sans-serif',
+                },
+                axisLine: { show: !pane.isCollapsed && gridBorderShow, lineStyle: { color: gridBorderColor } },
+                axisTick: { show: showLabels },
+                splitLine: { show: false },
+                axisPointer: {
+                    label: {
+                        show: isBottom,
+                        fontSize: 11,
+                        backgroundColor: '#475569',
+                    },
+                },
+            });
+        });
+
+        // --- Generate Y-Axes ---
+        const yAxis: any[] = [];
+
+        // Determine min/max for main Y-axis (respect custom values if provided)
+        let mainYAxisMin: any;
+        let mainYAxisMax: any;
+
+        if (options.yAxisMin !== undefined && options.yAxisMin !== 'auto') {
+            mainYAxisMin = options.yAxisMin;
+        } else {
+            mainYAxisMin = AxisUtils.createMinFunction(yAxisPaddingPercent);
+        }
+
+        if (options.yAxisMax !== undefined && options.yAxisMax !== 'auto') {
+            mainYAxisMax = options.yAxisMax;
+        } else {
+            mainYAxisMax = AxisUtils.createMaxFunction(yAxisPaddingPercent);
+        }
+
+        // Main Y-Axis (for candlesticks)
+        yAxis.push({
+            position: 'right',
+            scale: true,
+            min: mainYAxisMin,
+            max: mainYAxisMax,
+            gridIndex: 0,
+            splitLine: {
+                show: !isMainCollapsed && gridShow,
+                lineStyle: { color: gridLineColor, opacity: gridLineOpacity },
+            },
+            axisLine: { show: !isMainCollapsed && gridBorderShow, lineStyle: { color: gridBorderColor } },
+            axisLabel: {
+                show: !isMainCollapsed,
+                color: '#94a3b8',
+                fontFamily: options.fontFamily || 'sans-serif',
+                formatter: (value: number) => {
+                    if (options.yAxisLabelFormatter) {
+                        return options.yAxisLabelFormatter(value);
+                    }
+                    const decimals =
+                        options.yAxisDecimalPlaces !== undefined ? options.yAxisDecimalPlaces : AxisUtils.autoDetectDecimals(marketData as OHLCV[]);
+                    return AxisUtils.formatValue(value, decimals);
+                },
+            },
+        });
+
+        // Create separate Y-axes for overlay plots that are incompatible with price range
+        // Analyze each PLOT separately, not entire indicators
+        let nextYAxisIndex = 1;
+
+        // Calculate price range if market data is available
+        let priceMin = -Infinity;
+        let priceMax = Infinity;
+        if (marketData && marketData.length > 0) {
+            priceMin = Math.min(...marketData.map((d) => d.low));
+            priceMax = Math.max(...marketData.map((d) => d.high));
+        }
+
+        // Map to store plot-specific Y-axis assignments (key: "indicatorId::plotName")
+        const overlayYAxisMap: Map<string, number> = new Map();
+
+        indicators.forEach((indicator, id) => {
+            if (indicator.paneIndex === 0 && !indicator.collapsed) {
+                // This is an overlay on the main pane
+                // Analyze EACH PLOT separately
+
+                if (marketData && marketData.length > 0) {
+                    Object.entries(indicator.plots).forEach(([plotName, plot]) => {
+                        const plotKey = `${id}::${plotName}`;
+
+                        // Skip visual-only plot types that should never affect Y-axis scaling
+                        // EXCEPTION: shapes/chars with price-relative locations must stay on main Y-axis
+                        const visualOnlyStyles = ['background', 'barcolor'];
+
+                        // Check if this is a shape/char with price-relative positioning
+                        // Includes abovebar/belowbar (relative to candle) and absolute (exact Y value)
+                        const isShapeWithPriceLocation =
+                            (plot.options.style === 'shape' || plot.options.style === 'char') &&
+                            (plot.options.location === 'abovebar' ||
+                                plot.options.location === 'AboveBar' ||
+                                plot.options.location === 'ab' ||
+                                plot.options.location === 'belowbar' ||
+                                plot.options.location === 'BelowBar' ||
+                                plot.options.location === 'bl' ||
+                                plot.options.location === 'absolute' ||
+                                plot.options.location === 'Absolute');
+
+                        if (visualOnlyStyles.includes(plot.options.style)) {
+                            // Assign these to a separate Y-axis so they don't affect price scale
+                            if (!overlayYAxisMap.has(plotKey)) {
+                                overlayYAxisMap.set(plotKey, nextYAxisIndex);
+                                nextYAxisIndex++;
+                            }
+                            return; // Skip further processing for this plot
+                        }
+
+                        // If it's a shape/char but NOT with price-relative positioning, treat as visual-only
+                        if ((plot.options.style === 'shape' || plot.options.style === 'char') && !isShapeWithPriceLocation) {
+                            if (!overlayYAxisMap.has(plotKey)) {
+                                overlayYAxisMap.set(plotKey, nextYAxisIndex);
+                                nextYAxisIndex++;
+                            }
+                            return;
+                        }
+
+                        const values: number[] = [];
+
+                        // Extract values for this specific plot
+                        if (plot.data) {
+                            Object.values(plot.data).forEach((value) => {
+                                if (typeof value === 'number' && !isNaN(value) && isFinite(value)) {
+                                    values.push(value);
+                                }
+                            });
+                        }
+
+                        if (values.length > 0) {
+                            const plotMin = Math.min(...values);
+                            const plotMax = Math.max(...values);
+                            const plotRange = plotMax - plotMin;
+                            const priceRange = priceMax - priceMin;
+
+                            // Check if this plot's range is compatible with price range
+                            // Compatible = within price bounds with similar magnitude
+                            const isWithinBounds = plotMin >= priceMin * 0.5 && plotMax <= priceMax * 1.5;
+                            const hasSimilarMagnitude = plotRange > priceRange * 0.01; // At least 1% of price range
+
+                            const isCompatible = isWithinBounds && hasSimilarMagnitude;
+
+                            if (!isCompatible) {
+                                // This plot needs its own Y-axis - check if we already assigned one
+                                if (!overlayYAxisMap.has(plotKey)) {
+                                    overlayYAxisMap.set(plotKey, nextYAxisIndex);
+                                    nextYAxisIndex++;
+                                }
+                            }
+                            // Compatible plots stay on yAxisIndex: 0 (not added to map)
+                        }
+                    });
+                }
+            }
+        });
+
+        // Create Y-axes for incompatible plots
+        // nextYAxisIndex already incremented in the loop above, so we know how many axes we need
+        const numOverlayAxes = overlayYAxisMap.size > 0 ? nextYAxisIndex - 1 : 0;
+
+        // Track which overlay axes are for visual-only plots (background, barcolor, etc.)
+        const visualOnlyAxes = new Set<number>();
+        overlayYAxisMap.forEach((yAxisIdx, plotKey) => {
+            // Check if this plot is visual-only by looking at the original indicator
+            indicators.forEach((indicator) => {
+                Object.entries(indicator.plots).forEach(([plotName, plot]) => {
+                    const key = `${indicator.id}::${plotName}`;
+                    if (key === plotKey && ['background', 'barcolor', 'char'].includes(plot.options.style)) {
+                        visualOnlyAxes.add(yAxisIdx);
+                    }
+                });
+            });
+        });
+
+        for (let i = 0; i < numOverlayAxes; i++) {
+            const yAxisIndex = i + 1; // Y-axis indices start at 1 for overlays
+            const isVisualOnly = visualOnlyAxes.has(yAxisIndex);
+
+            yAxis.push({
+                position: 'left',
+                scale: !isVisualOnly, // Disable scaling for visual-only plots
+                min: isVisualOnly ? 0 : AxisUtils.createMinFunction(yAxisPaddingPercent), // Fixed range for visual plots
+                max: isVisualOnly ? 1 : AxisUtils.createMaxFunction(yAxisPaddingPercent), // Fixed range for visual plots
+                gridIndex: 0,
+                show: false, // Hide the axis visual elements
+                splitLine: { show: false },
+                axisLine: { show: false },
+                axisLabel: { show: false },
+            });
+        }
+
+        // Separate Panes Y-Axes (start after overlay axes)
+        const separatePaneYAxisOffset = nextYAxisIndex;
+        paneConfigs.forEach((pane, i) => {
+            yAxis.push({
+                position: 'right',
+                scale: true,
+                min: AxisUtils.createMinFunction(yAxisPaddingPercent),
+                max: AxisUtils.createMaxFunction(yAxisPaddingPercent),
+                gridIndex: i + 1,
+                splitLine: {
+                    show: !pane.isCollapsed && gridShow,
+                    lineStyle: { color: gridLineColor, opacity: gridLineOpacity * 0.6 },
+                },
+                axisLabel: {
+                    show: !pane.isCollapsed,
+                    color: '#94a3b8',
+                    fontFamily: options.fontFamily || 'sans-serif',
+                    fontSize: 10,
+                    formatter: (value: number) => {
+                        if (options.yAxisLabelFormatter) {
+                            return options.yAxisLabelFormatter(value);
+                        }
+                        const decimals =
+                            options.yAxisDecimalPlaces !== undefined
+                                ? options.yAxisDecimalPlaces
+                                : AxisUtils.autoDetectDecimals(marketData as OHLCV[]);
+                        return AxisUtils.formatValue(value, decimals);
+                    },
+                },
+                axisLine: { show: !pane.isCollapsed && gridBorderShow, lineStyle: { color: gridBorderColor } },
+            });
+        });
+
+        // --- Generate DataZoom ---
+        const dataZoom: any[] = [];
+        const zoomOnTouch = options.dataZoom?.zoomOnTouch ?? true;
+        const pannable = options.dataZoom?.pannable ?? true;
+
+        // 'inside' zoom provides pan/drag — enabled independently of slider visibility
+        if (zoomOnTouch && pannable) {
+            dataZoom.push({
+                type: 'inside',
+                xAxisIndex: allXAxisIndices,
+                start: dzStart,
+                end: dzEnd,
+                filterMode: 'weakFilter',
+            });
+        }
+
+        if (dzVisible) {
+            if (dzPosition === 'top') {
+                dataZoom.push({
+                    type: 'slider',
+                    xAxisIndex: allXAxisIndices,
+                    top: '1%',
+                    height: dzHeight + '%',
+                    start: dzStart,
+                    end: dzEnd,
+                    borderColor: '#334155',
+                    textStyle: { color: '#cbd5e1' },
+                    brushSelect: false,
+                    filterMode: 'weakFilter',
+                });
+            } else {
+                dataZoom.push({
+                    type: 'slider',
+                    xAxisIndex: allXAxisIndices,
+                    bottom: '1%',
+                    height: dzHeight + '%',
+                    start: dzStart,
+                    end: dzEnd,
+                    borderColor: '#334155',
+                    textStyle: { color: '#cbd5e1' },
+                    brushSelect: false,
+                    filterMode: 'weakFilter',
+                });
+            }
+        }
+
+        return {
+            grid,
+            xAxis,
+            yAxis,
+            dataZoom,
+            paneLayout: paneConfigs,
+            mainPaneHeight: mainHeightVal,
+            mainPaneTop,
+            pixelToPercent,
+            paneBoundaries,
+            overlayYAxisMap,
+            separatePaneYAxisOffset,
+        };
+    }
+
+    private static calculateMaximized(
+        containerHeight: number,
+        options: QFChartOptions,
+        targetPaneIndex: number, // 0 for main, 1+ for indicators
+    ): LayoutResult {
+        return {
+            grid: [],
+            xAxis: [],
+            yAxis: [],
+            dataZoom: [],
+            paneLayout: [],
+            mainPaneHeight: 0,
+            mainPaneTop: 0,
+            pixelToPercent: 0,
+            paneBoundaries: [],
+        } as any;
+    }
+}
