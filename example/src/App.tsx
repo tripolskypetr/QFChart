@@ -89,7 +89,7 @@ export default function App() {
             databox: { position: 'right', triggerOn: 'mousemove' },
             dataZoom: { visible: true, position: 'top', height: 6, start: 80, end: 101 },
             layout: { mainPaneHeight: '70%', gap: 5 },
-            controls: { collapse: true, maximize: true, fullscreen: true },
+            controls: { collapse: false, maximize: false, fullscreen: false },
           });
 
           chartRef.current.setMarketData(ohlcv);
@@ -98,7 +98,7 @@ export default function App() {
           indicatorRef.current = chartRef.current.addIndicator('indicator', plots, {
             overlay: isOverlay,
             height: isOverlay ? undefined : 30,
-            controls: { collapse: true, maximize: true },
+            controls: { collapse: false, maximize: false },
           });
 
           chartRef.current.registerPlugin(new QFChart.MeasureTool());
